@@ -19,7 +19,7 @@
 namespace strata::ds4::gguf::iq {
 
 // ggml type ids
-constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ3_XXS = 18, kIQ1_S = 19, kIQ3_S = 21,
+constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19, kIQ3_S = 21,
               kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
 
 /// Whether the device kernels take this ggml type.
@@ -80,6 +80,20 @@ struct SetArgs {
     int xh_vec = 0;    // (launch_set's: xh 16-byte aligned rows - the tensor-core tiles load 8 values at once)
     int skip_ge = 0;   // (the tiles) > 0: the experts of at least this many rows are left out - the caller's GEMMs
 };
+#if defined(STRATA_USE_HIP)
+// Host metadata for a prompt set, valid only within this scope; nested calls restore their caller's metadata.
+// Keeping it here leaves the shared EXL3/GGUF SetArgs ABI unchanged.
+class MmqRowsScope {
+public:
+    MmqRowsScope(int total_rows, const int* host_bounds);
+    ~MmqRowsScope();
+    MmqRowsScope(const MmqRowsScope&) = delete;
+    MmqRowsScope& operator=(const MmqRowsScope&) = delete;
+private:
+    int previous_rows_;
+    const int* previous_bounds_;
+};
+#endif
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
 bool set_down(const SetArgs& a, cudaStream_t s);
 /// The busy experts' path (a prompt's experts of many rows): one expert's matrix - n rows of k values, row_bytes(k)

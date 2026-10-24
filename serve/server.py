@@ -2893,7 +2893,7 @@ class StreamJob:
     sleeps mid-answer reconnects and carries on instead of losing it.  Only POST /v1/strata/cancel (the app's Stop)
     cancels it - a dropped connection does not."""
 
-    ORPHAN_S = 300   # a running answer nobody has read for this long (the page was closed) is cancelled
+    ORPHAN_S = 1800  # a running answer nobody has read for this long (the page was closed) is cancelled
 
     def __init__(self, jid: str, chunks, cancel: threading.Event):
         self.id, self.cancel = jid, cancel

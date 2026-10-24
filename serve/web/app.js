@@ -1843,13 +1843,13 @@ async function answer(resumeJob = null) {
       }
     }
   };
-  // reconnect to the running answer by id (every 2 s for up to 10 minutes, at once when the page is shown again)
+  // reconnect to the running answer by id (every 2 s for up to 30 minutes, at once when the page is shown again)
   const follow = async (gone) => {
     const t0 = Date.now();
     setHint(resumeJob ? "Taking the answer back up…" : "Connection lost - reconnecting to the answer…");
     for (;;) {
       if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
-      if (Date.now() - t0 > 600000) throw gone;
+      if (Date.now() - t0 > 1800000) throw gone;
       try {
         const r2 = await fetch(`v1/strata/stream?id=${encodeURIComponent(jobId)}&from=${nRecv}`,
                                {headers: headers(false), signal: controller.signal});
