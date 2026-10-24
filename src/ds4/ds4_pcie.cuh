@@ -22,6 +22,7 @@ struct Pull {
     unsigned long long src[8];
     unsigned ready[8][4];
     unsigned bad[8];
+    unsigned long long wpos[8][2];   // (a verify window's pull: slot i's expert serves plan entries t * 8 + j, these bits)
 };
 // the fetch kernel's device flags: the pull, each pick's matrices, then the blocks done (the last one sets Pull::done)
 constexpr int kPullCnt = 1 + 8 * 3, kPullFlags = kPullCnt + 1;
@@ -43,10 +44,12 @@ __device__ __forceinline__ void pull_nap() {
 // copied from pinned memory into its slot (vram + i stride; copy 0: the kernels read them where they lie - an
 // integrated GPU); then pick i's slot into plan2[i] (the second gate / up's plan: the streamed picks alone) and plan[i]
 // (the down pass and the sum take a streamed expert as a VRAM one); the last block to finish sets the pull's done
+// (win: a verify window's pull - slot i's expert into every plan entry wpos[i] names, before the window groups its
+// experts; no plan2, no second gate / up)
 __global__ void __launch_bounds__(256) stream_fetch_kernel(Pull* p, unsigned seq, unsigned* dflag, uint8_t* vram,
                                                            size_t stride, Mats m, int copy, unsigned long long* plan,
-                                                           unsigned long long* plan2, int k) {
-    __shared__ unsigned long long s_src[8];
+                                                           unsigned long long* plan2, int k, int win) {
+    __shared__ unsigned long long s_src[8], s_wpos[16];
     __shared__ unsigned s_bad[8];
     const int tid = threadIdx.x;
     volatile const Pull* vp = (volatile const Pull*) p;
@@ -67,6 +70,7 @@ __global__ void __launch_bounds__(256) stream_fetch_kernel(Pull* p, unsigned seq
         s_src[tid] = tid < k ? vp->src[tid] : 0ull;
         s_bad[tid] = 0u;
     }
+    if (win && blockIdx.x == 0 && tid < 16) s_wpos[tid] = vp->wpos[tid >> 1][tid & 1];
     __syncthreads();
     for (int i = 0; i < k; ++i) {
         if (s_src[i] == 0ull) continue;
@@ -102,7 +106,13 @@ __global__ void __launch_bounds__(256) stream_fetch_kernel(Pull* p, unsigned seq
             __threadfence_system();
         }
     }
-    if (blockIdx.x == 0 && tid < k) {
+    if (win) {
+        if (blockIdx.x == 0 && tid < 128)
+            for (int i = 0; i < k; ++i) {
+                if (((s_wpos[2 * i + (tid >> 6)] >> (tid & 63)) & 1ull) == 0ull || s_src[i] == 0ull || s_bad[i]) continue;
+                plan[tid] = copy ? (unsigned long long) (vram + (size_t) i * stride) : s_src[i];
+            }
+    } else if (blockIdx.x == 0 && tid < k) {
         const unsigned long long d = s_src[tid] == 0ull || s_bad[tid] ? 0ull
                                      : copy                          ? (unsigned long long) (vram + (size_t) tid * stride)
                                                                      : s_src[tid];
@@ -113,8 +123,8 @@ __global__ void __launch_bounds__(256) stream_fetch_kernel(Pull* p, unsigned seq
 
 inline void stream_fetch(Pull* p, unsigned seq, unsigned* dflag, uint8_t* vram, size_t stride, const Mats& m,
                          bool copy, unsigned long long* plan, unsigned long long* plan2, int k, int blocks,
-                         cudaStream_t s) {
-    stream_fetch_kernel<<<blocks, 256, 0, s>>>(p, seq, dflag, vram, stride, m, copy ? 1 : 0, plan, plan2, k);
+                         cudaStream_t s, bool win = false) {
+    stream_fetch_kernel<<<blocks, 256, 0, s>>>(p, seq, dflag, vram, stride, m, copy ? 1 : 0, plan, plan2, k, win ? 1 : 0);
 }
 
 }  // namespace strata::ds4::pcie

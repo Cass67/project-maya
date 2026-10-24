@@ -1061,6 +1061,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0,
                      s.experts > s0.experts ? 100.0 * (double) (s.cpu_experts - s0.cpu_experts) / (double) (s.experts - s0.experts)
                                             : 0.0);
+        if (s.stream_experts > s0.stream_experts)
+            std::fprintf(stderr, "maya ds4 serve: PCIe lane: %lld experts streamed (%lld for verify windows), decode's "
+                                 "VRAM hits %lld of %lld\n", (long long) (s.stream_experts - s0.stream_experts),
+                         (long long) (s.win_stream - s0.win_stream),
+                         (long long) ((se.experts - sd.experts) - (se.cpu_experts - sd.cpu_experts)),
+                         (long long) (se.experts - sd.experts));
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
         prof_line(s_dec, s);   // DS4_PROF: this request's decode (the CLI's line, a request at a time)

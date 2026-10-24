@@ -7885,6 +7885,7 @@ struct Model::Impl {
                 const int lc = T == 1 ? lane_class(li) : -1;
                 LaneTake lt;
                 if (lc >= 0) lane_take(l, ln_cls[(size_t) lc], picks, lt, next);
+                else if (T > 1 && lane_win_layer(l)) lane_take_win(l, ln_cls[(size_t) lane_class(li)], picks, next);
                 std::sort(picks.begin(), picks.end());
                 for (size_t a = 0; a < picks.size();) {
                     Ent en;
@@ -8224,6 +8225,7 @@ struct Model::Impl {
         for (int i = 0; i < kPicks; ++i) {
             P->src[i] = ((mask >> i) & 1u) ? (unsigned long long) (D.host_dev + (size_t) i * D.hstride) : 0ull;
             P->bad[i] = 0u;
+            P->wpos[i][0] = P->wpos[i][1] = 0ull;
         }
         std::atomic_thread_fence(std::memory_order_release);
         *(volatile unsigned*) &P->seq = seq;
@@ -8245,6 +8247,12 @@ struct Model::Impl {
     // (the device pulled it before it routed this request): waited for, its failures said
     void lane_take(const Layer& l, LaneCls& C, std::vector<std::pair<int, int>>& picks, LaneTake& lt, unsigned seq) {
         pcie::Pull* P = ln_pull + seq % kRing;
+        lane_reap();
+        lt.t0 = now_ms();
+        const LaneDev& D = ln_dev[(size_t) C.dev];
+        lane_take_rest(l, C, picks, lt, seq, P, D);
+    }
+    void lane_reap() {
         if (ln_job.n > 0) {
             const int jn = ln_job.n;
             if (lane_wait() != 0) {
@@ -8258,8 +8266,9 @@ struct Model::Impl {
             }
             ln_job.ab = -1;
         }
-        lt.t0 = now_ms();
-        const LaneDev& D = ln_dev[(size_t) C.dev];
+    }
+    void lane_take_rest(const Layer& l, LaneCls& C, std::vector<std::pair<int, int>>& picks, LaneTake& lt, unsigned seq,
+                        pcie::Pull* P, const LaneDev& D) {
         const int n = std::min((int) picks.size(), kPicks);
         unsigned cold = 0, m = 0;
         if (n > 0) {
@@ -8305,6 +8314,72 @@ struct Model::Impl {
             ln_job.ab = lt.ab_split ? lt.ab : -1;
             ln_job.t_start = lt.t0;
             ln_job.t_cpu = 0;
+        }
+    }
+    // DS4_STREAM_WIN=1 (the settings' MAYA_DS4_STREAM_WIN): a verify window's CPU-lane picks stream too - the window's
+    // distinct experts the CPU lane would take, split by the same costs (an expert streamed once serves every token of
+    // the window that picked it), each into its staging slot and from there into the plan entries that picked it, before
+    // the window groups its experts.  The host and the device test the same (lane_win_layer): the device waits for the
+    // pull.  Decode's own timings (lane_note, lane_ab) stay the decoded tokens'
+    static bool lane_win_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("DS4_STREAM_WIN");
+            if (v == nullptr) v = std::getenv("STRATA_DS4_STREAM_WIN");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
+    bool lane_win_layer(const Layer& l) const { return lane_win_on() && lane_class(l.il) >= 0 && l.n_cls <= 1; }
+    void lane_take_win(const Layer& l, LaneCls& C, std::vector<std::pair<int, int>>& picks, unsigned seq) {
+        pcie::Pull* P = ln_pull + seq % kRing;
+        lane_reap();
+        const LaneDev& D = ln_dev[(size_t) C.dev];
+        struct W {
+            int e = 0, n = 0;
+            unsigned long long pos[2] = {0ull, 0ull};
+        };
+        std::vector<W> ws;
+        for (const auto& pk : picks) {
+            size_t j = 0;
+            while (j < ws.size() && ws[j].e != pk.first) ++j;
+            if (j == ws.size()) ws.push_back(W{pk.first});
+            ws[j].pos[pk.second >> 6] |= 1ull << (pk.second & 63);
+            ++ws[j].n;
+        }
+        std::stable_sort(ws.begin(), ws.end(), [](const W& a, const W& b) { return a.n > b.n; });
+        const int n = std::min((int) ws.size(), kPicks);
+        unsigned cold = 0, m = 0;
+        for (int j = 0; j < n; ++j)
+            if (!lane_warm(l, ws[(size_t) j].e)) cold |= 1u << j;
+        if (n > 0 && !tok_ab_off && C.ab[cold != 0 ? 1 : 0].verdict >= 0) m = pcie::split(C.cost, n, cold, D.slots);
+        int slot[kPicks], ex[kPicks], ns = 0;
+        for (int i = 0; i < kPicks; ++i) {
+            P->src[i] = 0ull;
+            P->bad[i] = 0u;
+            P->wpos[i][0] = P->wpos[i][1] = 0ull;
+        }
+        for (int j = 0; j < n; ++j) {
+            if (((m >> j) & 1u) == 0u) continue;
+            P->src[ns] = (unsigned long long) (D.host_dev + (size_t) ns * D.hstride);
+            P->wpos[ns][0] = ws[(size_t) j].pos[0];
+            P->wpos[ns][1] = ws[(size_t) j].pos[1];
+            slot[ns] = ns;
+            ex[ns++] = ws[(size_t) j].e;
+        }
+        if (ns > 0) {
+            std::vector<std::pair<int, int>> keep;
+            for (const auto& pk : picks)
+                if (std::find(ex, ex + ns, pk.first) == ex + ns) keep.push_back(pk);
+            picks.swap(keep);
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        *(volatile unsigned*) &P->seq = seq;
+        C.n_stream += ns;
+        st.stream_experts += ns;
+        st.win_stream += ns;
+        if (ns > 0) {
+            lane_go(l, C.dev, ns, slot, ex, P, seq);
+            ln_job.ab = -1;
         }
     }
     // (serve_lane) after the CPU lane's part: decode's timing of it (the streamed picks need nothing from the host: the
@@ -11786,6 +11861,11 @@ struct Model::Impl {
                 mw.grp_start = d.grp_start;
                 mw.grp_ent = d.grp_ent;
                 mw.n_groups = d.n_groups;
+                if (lead && lane_win_layer(l)) {   // (DS4_STREAM_WIN: lane_take_win's pull into the plan)
+                    const LaneDev& LD = ln_dev[(size_t) l.dev];
+                    pcie::stream_fetch(ln_pull + slot, sq, LD.dflag, LD.vram, LD.stride, lane_mats(l), !LD.direct,
+                                       d.plan_ptr, LD.plan2, kPicks, LD.blocks, s, true);
+                }
                 gf::moe_win_group(mw, s);
                 x3::WinArgs wa;
                 wa.grp_ptr = d.grp_ptr;
