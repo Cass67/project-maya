@@ -3174,6 +3174,10 @@ struct Model::Impl {
             l.name = l.mtp ? "mtp." + std::to_string(il - g.nl) + "." : "layers." + std::to_string(il) + ".";
             l.n_exp = l.mtp ? g.d_n_exp : g.n_exp;
             l.k_exp = l.mtp ? g.d_k : g.k_exp;
+            if (!l.mtp && o.experts > 0 && o.experts < l.k_exp) {   // --experts N: the router's top N (route renormalises)
+                if (il == 0) std::fprintf(stderr, "ds4: experts per token: %d of %d\n", o.experts, l.k_exp);
+                l.k_exp = o.experts;
+            }
             l.ratio = g.ratios[(size_t) il];
             if (l.mtp) {   // window attention only: no compressor, indexer or Engram
                 if (l.ratio != 0 || l.n_exp <= 0 || l.k_exp <= 0 || l.k_exp > kPicks) {

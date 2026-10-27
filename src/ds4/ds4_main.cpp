@@ -98,7 +98,8 @@ void usage() {
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--suffix-draft N]\n"
-                 "           [--vision on|off] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto] [--experts N]\n"
+                 "           [--parallel N (--serve: N conversations at once)]\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
@@ -1909,7 +1910,8 @@ int main(int argc, char** argv) {
         else if (a == "--mmap-experts") {
             const std::string v = val("--mmap-experts");
             o.mmap_experts = v == "on" ? 1 : v == "off" ? 0 : -1;
-        } else if (a == "--images") images = val("--images");
+        } else if (a == "--experts") o.experts = std::max(1, std::atoi(val("--experts").c_str()));
+        else if (a == "--images") images = val("--images");
         else if (a == "--encode-image") enc_rgb = val("--encode-image");
         else if (a == "--dump-image") enc_out = val("--dump-image");
         else if (a == "--size") {

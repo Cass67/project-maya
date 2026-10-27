@@ -34,6 +34,7 @@ struct Options {
     // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
     // copied into RAM: 1 on, 0 off, -1 (auto) where the RAM this process can get does not hold them
     int mmap_experts = -1;
+    int experts = 0;                  // routed experts a token takes: the router's top n, renormalised (0: the model's)
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
     // prompt lookup (ds4_main's --suffix-draft): its verify windows run without the drafter too - their buffers (the
