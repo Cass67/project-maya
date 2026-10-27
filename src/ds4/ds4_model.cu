@@ -8510,8 +8510,18 @@ struct Model::Impl {
                 const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
                 const void* ap[gg::kMxCpuMaxN];
                 float* yp[gg::kMxCpuMaxN];
+                // each token's h copied to this job's stack first: read in place, a call of one or two experts - 40 jobs
+                // a node on the one row both nodes' gate/up jobs just wrote - took 200+ us a down job against 15 from
+                // the copy (2-socket Xeon, one expert: 0.67 -> 0.25 ms a call).  DS4_ACT_COPY=0: read in place
+                static const bool act_copy = std::getenv("DS4_ACT_COPY") == nullptr || std::atoi(std::getenv("DS4_ACT_COPY")) != 0;
+                constexpr size_t kAct = 3072;
+                alignas(64) uint8_t abuf[gg::kMxCpuMaxN * kAct];
                 for (int i = 0; i < en.n; ++i) {
                     ap[i] = hq + (size_t) (en.slot0 + i) * ha;
+                    if (act_copy && ha <= kAct) {
+                        std::memcpy(abuf + (size_t) i * kAct, ap[i], ha);
+                        ap[i] = abuf + (size_t) i * kAct;
+                    }
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + r0;
                 }
                 gg::mx_rows(mx_part_ptr(l, en.e, 2, X), dr, FF, r0 - X * Eh, r1 - X * Eh, ap, en.n, yp);
