@@ -6802,7 +6802,8 @@ struct Model::Impl {
         const int w = env_tri("DS4_STREAM_WIN"), d = env_tri("DS4_LAND");
         ln_win = w < 0 ? one : w != 0;
         ln_land = d < 0 ? one : d != 0;
-        gg::iq_cpu_iq1s_rows(one);
+        const int r1 = env_tri("DS4_IQ1S_ROWS");   // (1: IQ1_S own multi-token rows off the one-GPU path too)
+        gg::iq_cpu_iq1s_rows(r1 < 0 ? one : r1 != 0);
         if (pk.gguf)
             std::fprintf(stderr, "ds4: the one-GPU decode path (in-place pulls, windows streamed, landings): %s%s%s\n", why,
                          w >= 0 ? (w ? ", DS4_STREAM_WIN=1" : ", DS4_STREAM_WIN=0") : "",
