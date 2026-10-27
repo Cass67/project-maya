@@ -53,6 +53,9 @@
 #else
 #include <unistd.h>
 #include <cerrno>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace {
@@ -1834,6 +1837,17 @@ int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
 
 int main(int argc, char** argv) {
     strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
+#if defined(__linux__)
+    // the kernel's NUMA balancing (kernel.numa_balancing=1) scans memory whose policy migrates on fault: every thread
+    // then takes hinting faults - the launch thread hundreds a second, the CPU lane's workers on their shared scratch,
+    // each phase as slow as its straggler (a 2-socket Xeon: 3k faults/s decoding).  MPOL_LOCAL as the task policy,
+    // before any thread (they inherit it), allocates as the default does but takes the process out of the scan.
+    // DS4_NUMA_BALANCE=1: left to the kernel.  (A container needs SYS_NICE for set_mempolicy / mbind.)
+    if (const char* nb = std::getenv("DS4_NUMA_BALANCE"); nb == nullptr || std::atoi(nb) == 0)
+        if (syscall(SYS_set_mempolicy, 4 /* MPOL_LOCAL */, nullptr, 0) != 0)
+            std::fprintf(stderr, "ds4: set_mempolicy(MPOL_LOCAL) failed (%s): NUMA balancing still scans the engine\n",
+                         std::strerror(errno));
+#endif
     // cuBLAS gives the same bits run after run only with one stream active or with its workspace pinned (its notes on
     // reproducibility): the chunked prompt path's GEMMs run beside the copy and hc streams, and without this each
     // process could pick other kernels - a long prompt's logits differing from one start to the next.  Before any

@@ -5,6 +5,8 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -417,7 +419,14 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
     if (node >= 0 && nodes > 1) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
-        syscall(SYS_mbind, m, bytes, 1 /* MPOL_PREFERRED */, mask, 256, 0);
+        if (syscall(SYS_mbind, m, bytes, 1 /* MPOL_PREFERRED */, mask, 256, 0) != 0) {
+            // (said once: without it the per-node copies land wherever first touch puts them and nothing shows it -
+            //  Docker's default seccomp profile refuses mbind to a container without CAP_SYS_NICE)
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "ds4: mbind to NUMA node %d failed (%s): the RAM copies do not prefer their node "
+                                     "(a container needs SYS_NICE)\n", node, std::strerror(errno));
+        }
     }
     return m;
 #endif
