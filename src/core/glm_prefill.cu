@@ -592,6 +592,7 @@ struct Glm5Model::PrefillState {
     float *pre = nullptr, *post = nullptr, *comb = nullptr, *ss = nullptr, *mix = nullptr;
     uint16_t* x16 = nullptr;
     int* iota = nullptr;
+    int* dsa_cells = nullptr;       // glm-dsa: each row keeps its full layer's selection for the shared layers
     // KV streaming: one layer's latent cache in position order, staged from its host copy - what the prompt attention
     // reads (a chunk's selections can name any position, so the slots' window does not hold them).  The copy runs on
     // kv_ss once the attention before has read the stage (kv_free), while the layers in between compute; the layer it
@@ -1046,6 +1047,9 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 // ---------------------------------------------------------------- setup
 bool Glm5Model::prefill_setup(std::string& err) {
     (void) err;
+    // Never send the full model through Flash's mHC/NoPE prompt path.
+    // Its batched FFN + token-attention path remains opt-in until validated.
+    if (g_.dsa && getenv("STRATA_GLM_DSA_PREFILL") == nullptr) return true;
     if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
@@ -1101,7 +1105,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
                      why.substr(0, 400).c_str());
         return true;
     }
-    if (has_dsa && (g.kv_lora != 512 || g.n_head % 16 != 0 || g.kda_head_dim != 128)) {
+    if (!g.dsa && has_dsa && (g.kv_lora != 512 || g.n_head % 16 != 0 || g.kda_head_dim != 128)) {
         std::fprintf(stderr, "glm prefill: geometry not covered by the batched kernels - token by token\n");
         return true;
     }
@@ -1476,15 +1480,16 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     a.take<float>(T);
     a.take<float>(T * 24);
     a.take<int>(T * (size_t) g.n_exp_used);      // iota
+    if (g.dsa) a.take<int>(T * (size_t) g.idx_top_k);
     a.take<uint8_t>(kv_stage);
     size_t uni = 0;
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
-    if (has_dsa) { Carve d; carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
+    if (has_dsa && !g.dsa) { Carve d; carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
     if (has_moe) { Carve m; carve_moe(m, T, (size_t) shexp_sub(sub_env), g); uni = std::max(uni, m.off); }
     // the NextN block's cache fill (the last half) carves 4 n_embd + 1.5 n_embd rows of its own
-    if (mtp) uni = std::max(uni, T * (size_t) (6 * g.n_embd + g.kv_lora + 2 * g.idx_key) * 4 + 8 * 256);
+    if (mtp) uni = std::max(uni, T * (size_t) (6 * g.n_embd + g.kv_lora + (g.dsa ? g.n_rot : 0) + 2 * g.idx_key) * 4 + 8 * 256);
     return {a.off, uni};
 }
 
@@ -1560,6 +1565,7 @@ bool Glm5Model::prefill_carve(int Tn, int64_t end) {
     S->ss = a.take<float>(T);
     S->mix = a.take<float>(T * 24);
     S->iota = a.take<int>(T * (size_t) g.n_exp_used);
+    S->dsa_cells = g.dsa ? a.take<int>(T * (size_t) g.idx_top_k) : nullptr;
     S->kv_stage = stage > 0 ? a.take<uint8_t>(stage) : nullptr;
     S->uni = S->arena + a.off;
     blas_ck(cublasSetWorkspace(S->blas, S->ws, S->ws_bytes), "set workspace");
@@ -2093,6 +2099,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // the mHC read half for the whole chunk: (write half of the previous block,) mix dots, gates, x / x16
     const auto hc_read = [&](const float* block_out, const uint16_t* fn, const float* scale, const float* base,
                              const float* norm) {
+        if (g.dsa) {
+            if (block_out != nullptr) {
+                const int64_t n = (int64_t) T * E;
+                add_f32_kernel<<<(unsigned) std::min<int64_t>(4096, (n + 255) / 256), 256, 0, s>>>(S->R, block_out, n);
+            }
+            gb::rms_rows(S->R, norm, g.norm_eps, T, E, S->x, S->x16, s);
+            return;
+        }
         gb::hc_update(block_out, S->R, S->post, S->comb, S->ss, T, E, s);
         sgemm_bf16(fn, 24, 4 * E, S->R, 4 * E, S->mix, 24, T, 1.0f);
         gb::HcFinishArgs h;
@@ -2494,7 +2508,26 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         uint16_t* const lat = kv_host != nullptr ? (uint16_t*) S->kv_stage : (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
 
         // ---- the mixer, in sub-batches of S->sub tokens (the recurrences carry their state across)
-        for (int t0 = 0; t0 < T; t0 += S->sub) {
+        if (g.dsa) {
+            // Keep the already-validated roped MLA/indexer arithmetic while batching
+            // the dense/shared/routed FFNs below. Each row owns its selection across
+            // full/shared layers; a single F->cells would reuse the last row's top-k.
+            struct Restore {
+                FastState* f;
+                float *x, *mixer;
+                int* cells;
+                int n_sel;
+                ~Restore() { f->x = x; f->mixer = mixer; f->cells = cells; f->dsa_n_sel = n_sel; }
+            } restore{F, F->x, F->mixer, F->cells, F->dsa_n_sel};
+            for (int t = 0; t < T; ++t) {
+                F->x = S->x + (size_t) t * E;
+                F->mixer = S->mixer + (size_t) t * E;
+                F->cells = S->dsa_cells + (size_t) t * g.idx_top_k;
+                F->dsa_n_sel = std::min<int64_t>(g.idx_top_k, p0 + t + 1);
+                gf::quantize_q8_1(F->x, F->xq, E, s);
+                if (!fast_dsa_rope(il, p0 + t, err)) return false;
+            }
+        } else for (int t0 = 0; t0 < T; t0 += S->sub) {
             const int tn = std::min(S->sub, T - t0);
             const float* xs = S->x + (size_t) t0 * E;
             const uint16_t* x16 = S->x16 + (size_t) t0 * E;
@@ -3413,7 +3446,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             return blas_dev[dev] - 1;
 #endif
         }();
-        const bool use_blas = blas_rows > 0 && !Ly.exl3 && mmq::to_f16_supported(Ly.gu_type) &&
+        const bool use_blas = 2 * nff == E && blas_rows > 0 && !Ly.exl3 && mmq::to_f16_supported(Ly.gu_type) &&
                               mmq::to_f16_supported(Ly.d_type) && S->w16_elems >= (int64_t) 2 * nff * E + E;
         const auto run_blas_q = [&](const uint8_t* blob, int a, int nrows, int r0) {
             namespace x3 = strata::kernels::exl3;
@@ -3468,8 +3501,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             else if (use_blas) run_set_q(wbase, n_exp, stride, d_bounds, hb, r0);
             else run_set(wbase, n_exp, stride, d_bounds, hb, r0);
         };
-        if (2 * nff != E) {
-            err = "glm prefill: 2 * n_ff_exp != n_embd (the gate/up rows would not fit the set's output rows)";
+        if (2 * nff > E) {
+            err = "glm prefill: 2 * n_ff_exp > n_embd (the gate/up rows would not fit the set's output rows)";
             return false;
         }
         // the disk-only experts (staged last, ascending): their indices in the reader's order - inside the segment
@@ -3976,7 +4009,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     }
     // the last layer's write half: R = post x ffn + comb . R
     if (!tail_skip) {
-        gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
+        if (g.dsa) {
+            const int64_t n = (int64_t) T * E;
+            add_f32_kernel<<<(unsigned) std::min<int64_t>(4096, (n + 255) / 256), 256, 0, s>>>(S->R, S->ffn, n);
+        } else gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
     }
     // ---- the NextN block's caches for these positions (the half that carries it): position p reads h_p and the
@@ -4001,63 +4037,75 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 else
                     tt->to_float(pack_emb_src_ + (size_t) next_ids[t] * row_b, S->emb_h + (size_t) t * E, E);
             }
-            Carve c{S->uni};
-            float* h = c.take<float>((size_t) Tv * E);
-            float* emb = c.take<float>((size_t) Tv * E);
-            uint16_t* cat16 = c.take<uint16_t>((size_t) Tv * 2 * E);
-            float* hid = c.take<float>((size_t) Tv * E);
-            float* kv = c.take<float>((size_t) Tv * g.kv_lora);
-            float* ik = c.take<float>((size_t) Tv * g.idx_key);
-            float* ig = c.take<float>((size_t) Tv * g.idx_key);
-            cudaMemcpyAsync(emb, S->emb_h, (size_t) Tv * E * sizeof(float), cudaMemcpyHostToDevice, s);
-            gb::head_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, s);
-            gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, Tv, E, cat16, s);
-            hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, Tv, 0.0f);
-            gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, Tv, E, S->x, S->x16, s);
-            hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, E, kv, g.kv_lora, Tv, 0.0f);
-            sgemm_bf16(Ly.idx_k, g.idx_key, E, S->x, E, ik, g.idx_key, Tv, 1.0f);
-            sgemm_bf16(Ly.idx_gate, g.idx_key, E, S->x, E, ig, g.idx_key, Tv, 1.0f);
-            gb::DsaPrepArgs d;
-            d.kv_raw = kv;
-            d.kv_norm = Ly.kv_a_norm;
-            d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
-            if (kv_ != nullptr && kv_->host[(size_t) mtp_il_] != nullptr) {   // KV streaming: no attention here, no stage
-                d.lat = nullptr;
-                d.lat_host = (uint16_t*) kv_->host[(size_t) mtp_il_];
-                d.lat_slots = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
-                d.lat_table = kv_->map[(size_t) mtp_il_].page_table;
-                d.lat_page = kv_->page;
+            if (g.dsa) {
+                // Use the draft's token-path quantization for its prompt caches too.
+                // An FP16 eh_proj here introduces an extra arithmetic change before
+                // the draft has even started; its cache fill needs no draft FFN/head.
+                for (int t = 0; t < Tv; ++t) {
+                    cudaMemcpyAsync(F->emb, S->emb_h + (size_t) t * E, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+                    head_res(S->R + (size_t) t * E, F->head_x, F->head_xq, s);
+                    if (!fast_mtp_cache_rope(p0 + t, F->head_x, F->emb, err)) return false;
+                }
+                S->mark("mtp_cache", s);
+            } else {
+                Carve c{S->uni};
+                float* h = c.take<float>((size_t) Tv * E);
+                float* emb = c.take<float>((size_t) Tv * E);
+                uint16_t* cat16 = c.take<uint16_t>((size_t) Tv * 2 * E);
+                float* hid = c.take<float>((size_t) Tv * E);
+                float* kv = c.take<float>((size_t) Tv * g.kv_lora);
+                float* ik = c.take<float>((size_t) Tv * g.idx_key);
+                float* ig = c.take<float>((size_t) Tv * g.idx_key);
+                cudaMemcpyAsync(emb, S->emb_h, (size_t) Tv * E * sizeof(float), cudaMemcpyHostToDevice, s);
+                gb::head_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, s);
+                gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, Tv, E, cat16, s);
+                hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, Tv, 0.0f);
+                gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, Tv, E, S->x, S->x16, s);
+                hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, E, kv, g.kv_lora, Tv, 0.0f);
+                sgemm_bf16(Ly.idx_k, g.idx_key, E, S->x, E, ik, g.idx_key, Tv, 1.0f);
+                sgemm_bf16(Ly.idx_gate, g.idx_key, E, S->x, E, ig, g.idx_key, Tv, 1.0f);
+                gb::DsaPrepArgs d;
+                d.kv_raw = kv;
+                d.kv_norm = Ly.kv_a_norm;
+                d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+                if (kv_ != nullptr && kv_->host[(size_t) mtp_il_] != nullptr) {   // KV streaming: no attention here, no stage
+                    d.lat = nullptr;
+                    d.lat_host = (uint16_t*) kv_->host[(size_t) mtp_il_];
+                    d.lat_slots = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+                    d.lat_table = kv_->map[(size_t) mtp_il_].page_table;
+                    d.lat_page = kv_->page;
+                }
+                d.lat_q8 = lat_q8_;
+                d.kv_lora = g.kv_lora;
+                d.ik_raw = ik;
+                d.k_norm_w = Ly.k_norm_w;
+                d.k_norm_b = Ly.k_norm_b;
+                d.ik_cache = state_ + dsa_ik_[(size_t) mtp_il_];
+                d.ig_raw = ig;
+                d.ig_cache = state_ + dsa_ig_[(size_t) mtp_il_];
+                d.idx_key = g.idx_key;
+                d.ring = ik_ring_;
+                d.eps = g.norm_eps;
+                // in pieces the indexer's key / gate ring holds with the open pool before them (a one-GPU chunk is up to
+                // 32K positions, the ring ~8K): each piece's rows are pooled before the next one overwrites the ring
+                const int kp = g.idx_kpool;
+                const int piece = std::max(kp, ik_ring_ - 64);
+                for (int t0 = 0; t0 < Tv; t0 += piece) {
+                    const int tn = std::min(piece, Tv - t0);
+                    d.kv_raw = kv + (size_t) t0 * g.kv_lora;
+                    d.ik_raw = ik + (size_t) t0 * g.idx_key;
+                    d.ig_raw = ig + (size_t) t0 * g.idx_key;
+                    d.p0 = (int) p0 + t0;
+                    d.T = tn;
+                    gb::dsa_prep(d, s);
+                    const int pool_lo = (int) ((p0 + t0 + kp) / kp - 1), pool_hi = (int) ((p0 + t0 + tn) / kp - 1);
+                    if (pool_hi >= pool_lo)
+                        gb::dsa_pool(state_ + dsa_ik_[(size_t) mtp_il_], state_ + dsa_ig_[(size_t) mtp_il_], Ly.ape,
+                                     state_ + dsa_pool_[(size_t) mtp_il_], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
+                                     ik_ring_);
+                }
+                S->mark("mtp_cache", s);
             }
-            d.lat_q8 = lat_q8_;
-            d.kv_lora = g.kv_lora;
-            d.ik_raw = ik;
-            d.k_norm_w = Ly.k_norm_w;
-            d.k_norm_b = Ly.k_norm_b;
-            d.ik_cache = state_ + dsa_ik_[(size_t) mtp_il_];
-            d.ig_raw = ig;
-            d.ig_cache = state_ + dsa_ig_[(size_t) mtp_il_];
-            d.idx_key = g.idx_key;
-            d.ring = ik_ring_;
-            d.eps = g.norm_eps;
-            // in pieces the indexer's key / gate ring holds with the open pool before them (a one-GPU chunk is up to
-            // 32K positions, the ring ~8K): each piece's rows are pooled before the next one overwrites the ring
-            const int kp = g.idx_kpool;
-            const int piece = std::max(kp, ik_ring_ - 64);
-            for (int t0 = 0; t0 < Tv; t0 += piece) {
-                const int tn = std::min(piece, Tv - t0);
-                d.kv_raw = kv + (size_t) t0 * g.kv_lora;
-                d.ik_raw = ik + (size_t) t0 * g.idx_key;
-                d.ig_raw = ig + (size_t) t0 * g.idx_key;
-                d.p0 = (int) p0 + t0;
-                d.T = tn;
-                gb::dsa_prep(d, s);
-                const int pool_lo = (int) ((p0 + t0 + kp) / kp - 1), pool_hi = (int) ((p0 + t0 + tn) / kp - 1);
-                if (pool_hi >= pool_lo)
-                    gb::dsa_pool(state_ + dsa_ik_[(size_t) mtp_il_], state_ + dsa_ig_[(size_t) mtp_il_], Ly.ape,
-                                 state_ + dsa_pool_[(size_t) mtp_il_], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
-                                 ik_ring_);
-            }
-            S->mark("mtp_cache", s);
         }
     }
     S->collect();
@@ -4516,7 +4564,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         }
         // the embedding lands in x (free until the first layer's gates write it) and fans out to the 4 streams
         cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
-        gb::embed_rows(S->x, S->R, T, E, fast_->cs);
+        if (g.dsa) cudaMemcpyAsync(S->R, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToDevice, fast_->cs);
+        else gb::embed_rows(S->x, S->R, T, E, fast_->cs);
         return true;
     };
     std::vector<Glm5Model*> parts;
