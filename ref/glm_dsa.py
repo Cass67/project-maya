@@ -318,6 +318,8 @@ def main() -> int:
     ap.add_argument("--tokens", default="1,2,3,4,5,6,7,8", help="comma-separated token ids")
     ap.add_argument("--dump-dir", default=None, help="write every cb() seam here as .npy")
     ap.add_argument("--logits-out", default=None, help="write the (T, vocab) f32 logits here (.npy)")
+    ap.add_argument("--dump-raw-dir", default=None,
+                    help="write every array seam as raw ggml-order f32 (+ manifest.txt), like ref/glm.py")
     args = ap.parse_args()
 
     m = GlmDsa(args.model)
@@ -342,6 +344,19 @@ def main() -> int:
             if isinstance(arr, np.ndarray):
                 np.save(d / f"{name}.npy", arr)
         print(f"dumps -> {d}")
+    if args.dump_raw_dir:
+        # ggml layout (features fastest): the numpy axes fully reversed, the manifest carries the reversed shape
+        d = pathlib.Path(args.dump_raw_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for name, arr in m.dumps.items():
+            if not isinstance(arr, np.ndarray):
+                continue
+            rev = np.ascontiguousarray(arr.transpose(tuple(range(arr.ndim - 1, -1, -1))))
+            rev.astype(np.int32 if arr.dtype == np.int64 else F32).tofile(d / f"{name}.f32")
+            lines.append(f"{name} {' '.join(str(x) for x in reversed(arr.shape))}")
+        (d / "manifest.txt").write_text("\n".join(lines) + "\n")
+        print(f"raw dumps -> {d}")
     return 0
 
 
