@@ -47,12 +47,14 @@ static int probe_pack(const std::string& dir, const std::string& ids, const std:
     }
     strata::core::Glm5Model model;
     std::string err;
-    require(model.load_pack_env(dir, 256, err), "load_pack: " + err);
+    const bool loaded = model.load_pack_env(dir, 256, err);   // (before the message: argument order is unspecified)
+    require(loaded, "load_pack: " + err);
     FILE* f = std::fopen(out.c_str(), "wb");
     require(f != nullptr, "cannot write " + out);
     for (int32_t tok : tokens) {
         std::vector<float> lg;
-        require(model.forward({tok}, lg, err), "forward: " + err);
+        const bool ok = model.forward({tok}, lg, err);
+        require(ok, "forward: " + err);
         std::fwrite(lg.data(), sizeof(float), lg.size(), f);
         std::printf("pos %lld token %d argmax %zu\n", (long long) model.position() - 1, tok, argmax(lg.data(), lg.size()));
         std::fflush(stdout);
@@ -74,7 +76,8 @@ int main(int argc, char** argv) {
 
     strata::core::Glm5Model model;
     std::string err;
-    require(model.load(gguf, 64, err), "load: " + err);
+    const bool loaded = model.load(gguf, 64, err);
+    require(loaded, "load: " + err);
     require(model.geometry().dsa, "the synthetic did not load as glm-dsa");
     const size_t V = (size_t) model.geometry().n_vocab;
     const size_t T = tokens.size();
@@ -91,8 +94,8 @@ int main(int argc, char** argv) {
     for (size_t t = 1; t <= T; ++t) {
         model.reset();
         std::vector<float> lg;
-        require(model.forward(std::vector<int32_t>(tokens.begin(), tokens.begin() + (long) t), lg, err),
-                "forward: " + err);
+        const bool ok = model.forward(std::vector<int32_t>(tokens.begin(), tokens.begin() + (long) t), lg, err);
+        require(ok, "forward: " + err);
         const float* col = oracle.data() + V * (t - 1);
         const double d = max_abs(lg.data(), col, V);
         worst = std::max(worst, d);
@@ -104,7 +107,10 @@ int main(int argc, char** argv) {
     // ---- 2. streaming vs the batched call
     model.reset();
     std::vector<float> streamed;
-    for (int32_t tok : tokens) require(model.forward({tok}, streamed, err), "streamed forward: " + err);
+    for (int32_t tok : tokens) {
+        const bool ok = model.forward({tok}, streamed, err);
+        require(ok, "streamed forward: " + err);
+    }
     const double d_stream = max_abs(streamed.data(), last.data(), V);
     require(d_stream < 1e-5, "streamed and batched logits differ (" + std::to_string(d_stream) + ")");
 
