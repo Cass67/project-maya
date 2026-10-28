@@ -401,6 +401,8 @@ struct Glm5Model::FastState {
     float* rep = nullptr;   // a window commit's replay (win_commit_part): kKdaLayers x 5 x d_inner (q k v g1 g2)
     float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
     float *q = nullptr, *iq = nullptr, *score = nullptr;
+    float* qabs = nullptr;   // glm-dsa: gf::mla_pe's scratch (the absorbed queries, then the heads' outputs)
+    int dsa_n_sel = 0;       // glm-dsa: the last full indexer layer's selection width (its cells in `cells`)
     int* cells = nullptr;
     int* slot_cells = nullptr;   // KV streaming: the selection in VRAM slot rows (glm_kv_resolve), what the attention reads
     void *qr_q = nullptr, *attn_q = nullptr;
