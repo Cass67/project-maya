@@ -3726,13 +3726,20 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         size_t pool_bytes_cap = pool_avail;
         if (const char* ps = getenv("STRATA_GLM_POOL_SLOTS0"))
             pool_bytes_cap = std::min<size_t>(pool_avail, (size_t) std::atoi(ps) * slot_bytes_);
-        // per-class bytes proportional to that class's byte demand
+        // every class first gets one route's worth of slots (n_exp_used): a token's experts for a layer must all be
+        // resident at once, and a rare class (one layer of a different recipe - GLM-5.3 UD-Q2_K_XL's layer 8) given
+        // fewer evicted its own route's experts before the kernel read them.  The rest is proportional to demand.
+        size_t floor_b = 0;
+        for (int c = 0; c < pool_nclasses_; ++c) floor_b += (size_t) g_.n_exp_used * c_stride[(size_t) c];
+        const size_t share_b = pool_bytes_cap > floor_b ? pool_bytes_cap - floor_b : 0;
         size_t off = 0;
         int64_t base = 0;
         int64_t slots_total = 0;
+        bool every_class = true;
         for (int c = 0; c < pool_nclasses_; ++c) {
             class_stride_[c] = c_stride[(size_t) c];
-            const size_t bytes_c = c_weight[(size_t) c] ? (size_t) ((double) pool_bytes_cap *
+            const size_t bytes_c = c_weight[(size_t) c] ? (size_t) g_.n_exp_used * c_stride[(size_t) c] +
+                                                (size_t) ((double) share_b *
                                                 ((double) c_weight[(size_t) c] * (double) c_stride[(size_t) c]) /
                                                 weight_sum) : 0;
             class_slots_[c] = std::min<int64_t>((int64_t) (bytes_c / class_stride_[c]),
@@ -3742,9 +3749,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             off += (size_t) class_slots_[c] * class_stride_[c];
             base += class_slots_[c];
             slots_total += class_slots_[c];
+            every_class = every_class && (c_weight[(size_t) c] == 0 || class_slots_[c] >= g_.n_exp_used);
         }
         pool_bytes_ = off;
-        dev_experts_ = slots_total >= g_.n_exp_used;
+        dev_experts_ = every_class && floor_b <= pool_bytes_cap && slots_total >= g_.n_exp_used;
     }
     if (dev_experts_) {
         cudaError_t e_ = cudaMalloc(&pool_, pool_bytes_);
