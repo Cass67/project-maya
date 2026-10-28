@@ -1053,9 +1053,6 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 // ---------------------------------------------------------------- setup
 bool Glm5Model::prefill_setup(std::string& err) {
     (void) err;
-    // Never send the full model through Flash's mHC/NoPE prompt path.
-    // Its batched FFN + token-attention path remains opt-in until validated.
-    if (g_.dsa && getenv("STRATA_GLM_DSA_PREFILL") == nullptr) return true;
     if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
