@@ -580,6 +580,8 @@ public:
     bool fast_token(int32_t token, std::string& err);
     bool fast_layers(int64_t p, bool hop_in, std::string& err);
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
+    bool fast_dsa_rope(int il, int64_t p, std::string& err);   // glm-dsa's mixer (roped MLA, token indexer)
+    bool fast_layers_dsa(int64_t p, std::string& err);         // glm-dsa's plain-residual layer loop
     bool fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wait = true);   // one MoE FFN (x -> ffn)
     bool moe_defer_wait_ = false;                            // (fast_moe's cpu_wait = false: the caller waits)
     // ... its routed experts, once the router and the shared expert's gate / up have run: the token path's own

@@ -6,6 +6,7 @@
 // serial reference kernels - the values agree to float rounding, which the fast-vs-reference check in
 // glm_pack_test pins on the real model.
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/iq_kernels.hpp"   // quantize_q8_1_rows (mla_pe)
 #include "strata/kernels/glm_batch.hpp"   // mla_decode_v70 (Volta)
 #include "strata/kernels/exl3.hpp"
 #if defined(STRATA_USE_HIP)
@@ -5009,10 +5010,10 @@ __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, con
                                                       float* __restrict__ x, block_q8_1* __restrict__ xq) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
-    float v[4];
+    float v[8];
     float ss = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const int e = tid + 1024 * i;
         float t = e < n ? h[e] : 0.0f;
         if (add != nullptr && e < n) {
@@ -5025,7 +5026,7 @@ __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, con
     ss = block_sum(ss, sred);
     const float inv = rsqrtf(ss / (float) n + eps);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const int e = tid + 1024 * i;
         if (e >= n) break;
         const float xv = v[i] * inv * w[e];
@@ -7001,6 +7002,169 @@ void argmax_pair(const float* x, int n, int* out, cudaStream_t s) {
 void argmax_join(const int* a, const int* b, int c0, int* out, cudaStream_t s) {
     argmax_join_kernel<<<1, 1, 0, s>>>(a, b, c0, out);
     launch_check("argmax_join");
+}
+
+// ---------------------------------------------------------------- glm-dsa (GLM-5.3): roped MLA + the token indexer
+// ref/glm_dsa.py's arithmetic; the reference path's kernels (glm_model.cu, glm_dsa.cu) are the parity they follow.
+namespace {
+
+// the rotation of pair i (ggml rope NORM, no YaRN): theta = pos * base^(-2i/n_rot), stepped in f32 like ggml's cache
+__device__ __forceinline__ void rope_pair(float x0, float x1, int i, int n_rot, int pos, float base, float& y0,
+                                          float& y1) {
+    const float theta_scale = powf(base, -2.0f / (float) n_rot);
+    float theta = (float) pos;
+    for (int k = 0; k < i; ++k) theta *= theta_scale;
+    const float c = cosf(theta), sn = sinf(theta);
+    y0 = x0 * c - x1 * sn;
+    y1 = x0 * sn + x1 * c;
+}
+
+__global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) {
+    __shared__ float sred[32];
+    __shared__ float sy[1024];
+    const int tid = threadIdx.x, lane = tid & 31;
+    if (blockIdx.x == 0) {   // qr = rms(qr_raw) * w, and its q8_1
+        float ss = 0.0f;
+        for (int e = tid; e < a.q_lora; e += blockDim.x) ss += a.qr_raw[e] * a.qr_raw[e];
+        const float inv = rsqrtf(block_sum(ss, sred) / (float) a.q_lora + a.eps);
+        for (int e = tid; e < a.q_lora; e += blockDim.x) {
+            const float xv = a.qr_raw[e] * inv * a.q_a_norm[e];
+            a.qr[e] = xv;
+            q8_1_store_warp(xv, (block_q8_1*) a.qr_q + e / 32, lane);
+        }
+    } else if (blockIdx.x == 1) {   // the latent (normed, FP16 cache row p) and k_pe (roped, NOT normed, F32 row p)
+        float ss = 0.0f;
+        for (int e = tid; e < a.kv_lora; e += blockDim.x) ss += a.kv_raw[e] * a.kv_raw[e];
+        const float inv = rsqrtf(block_sum(ss, sred) / (float) a.kv_lora + a.eps);
+        for (int e = tid; e < a.kv_lora; e += blockDim.x)
+            a.lat[(size_t) a.p * a.kv_lora + e] = __half_as_ushort(__float2half(a.kv_raw[e] * inv * a.kv_norm[e]));
+        if (tid < a.n_rot / 2) {
+            float y0, y1;
+            rope_pair(a.kv_raw[a.kv_lora + 2 * tid], a.kv_raw[a.kv_lora + 2 * tid + 1], tid, a.n_rot, a.p, a.base, y0, y1);
+            a.kpe[(size_t) a.p * a.n_rot + 2 * tid] = y0;
+            a.kpe[(size_t) a.p * a.n_rot + 2 * tid + 1] = y1;
+        }
+    } else if (a.ik_raw != nullptr) {   // the indexer key: layer norm (w, b), roped on its first n_rot dims -> row p
+        const int n = a.idx_key;
+        float sum = 0.0f;
+        for (int e = tid; e < n; e += blockDim.x) sum += a.ik_raw[e];
+        const float mu = block_sum(sum, sred) / (float) n;
+        float var = 0.0f;
+        for (int e = tid; e < n; e += blockDim.x) var += (a.ik_raw[e] - mu) * (a.ik_raw[e] - mu);
+        const float inv = rsqrtf(block_sum(var, sred) / (float) n + a.ln_eps);
+        for (int e = tid; e < n; e += blockDim.x) sy[e] = (a.ik_raw[e] - mu) * inv * a.k_norm_w[e] + a.k_norm_b[e];
+        __syncthreads();
+        float* row = a.ik + (size_t) a.p * n;
+        if (tid < a.n_rot / 2) {
+            float y0, y1;
+            rope_pair(sy[2 * tid], sy[2 * tid + 1], tid, a.n_rot, a.p, a.base, y0, y1);
+            row[2 * tid] = y0;
+            row[2 * tid + 1] = y1;
+        }
+        for (int e = a.n_rot + tid; e < n; e += blockDim.x) row[e] = sy[e];
+    }
+}
+
+__global__ void rope_heads_kernel(float* __restrict__ x, int n_rot, int stride, int n_head, int pos, float base) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_head * (n_rot / 2)) return;
+    const int h = idx / (n_rot / 2), i = idx % (n_rot / 2);
+    float* xh = x + (size_t) stride * h + 2 * i;
+    float y0, y1;
+    rope_pair(xh[0], xh[1], i, n_rot, pos, base, y0, y1);
+    xh[0] = y0;
+    xh[1] = y1;
+}
+
+// q_abs[h][c] = sum_e wk_b[h][c][e] * q_nope[h][e]   (wk_b BF16 {qk_nope, kv_lora, n_head}; q heads k_mla apart)
+__global__ void mla_pe_qabs_kernel(const float* __restrict__ q, int k_mla, int qk_nope, const uint16_t* __restrict__ wk_b,
+                                   int kv_lora, int n_head, float* __restrict__ q_abs) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= kv_lora * n_head) return;
+    const int h = idx / kv_lora, c = idx % kv_lora;
+    const uint16_t* w = wk_b + (size_t) qk_nope * c + (size_t) qk_nope * kv_lora * h;
+    const float* qh = q + (size_t) k_mla * h;
+    float acc = 0.0f;
+    for (int e = 0; e < qk_nope; ++e) acc += bf(w[e]) * qh[e];
+    q_abs[idx] = acc;
+}
+
+// one block a head: scores (q_abs . latent + q_pe . k_pe) / sqrt(qk_nope + n_rot) over the cells, softmax, ctx, wv_b . ctx
+__global__ void __launch_bounds__(256) mla_pe_attend_kernel(const float* __restrict__ q_abs, const float* __restrict__ q,
+                                                            int k_mla, int qk_nope, int n_rot,
+                                                            const uint16_t* __restrict__ lat,
+                                                            const float* __restrict__ kpe, const int* __restrict__ cells,
+                                                            int n_sel, const uint16_t* __restrict__ wv_b, int kv_lora,
+                                                            int v_head, float* __restrict__ out) {
+    extern __shared__ float sm[];
+    float* prob = sm;                 // n_sel
+    float* ctx = sm + n_sel;          // kv_lora
+    float* qa = ctx + kv_lora;        // kv_lora
+    float* qp = qa + kv_lora;         // n_rot
+    __shared__ float sred[32];
+    const int h = blockIdx.x, tid = threadIdx.x;
+    for (int c = tid; c < kv_lora; c += blockDim.x) qa[c] = q_abs[(size_t) kv_lora * h + c];
+    for (int e = tid; e < n_rot; e += blockDim.x) qp[e] = q[(size_t) k_mla * h + qk_nope + e];
+    __syncthreads();
+    const float scale = rsqrtf((float) (qk_nope + n_rot));
+    float mx = -INFINITY;
+    for (int s = tid; s < n_sel; s += blockDim.x) {
+        const int cell = cells[s];
+        const uint16_t* lr = lat + (size_t) kv_lora * cell;
+        float dot = 0.0f;
+        for (int c = 0; c < kv_lora; ++c) dot += qa[c] * __half2float(__ushort_as_half(lr[c]));
+        const float* kr = kpe + (size_t) n_rot * cell;
+        for (int e = 0; e < n_rot; ++e) dot += qp[e] * kr[e];
+        prob[s] = dot * scale;
+        mx = fmaxf(mx, prob[s]);
+    }
+    mx = block_max(mx, sred);
+    float sum = 0.0f;
+    for (int s = tid; s < n_sel; s += blockDim.x) {
+        prob[s] = expf(prob[s] - mx);
+        sum += prob[s];
+    }
+    const float inv = 1.0f / block_sum(sum, sred);
+    __syncthreads();
+    for (int c = tid; c < kv_lora; c += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < n_sel; ++s) acc += prob[s] * __half2float(__ushort_as_half(lat[(size_t) kv_lora * cells[s] + c]));
+        ctx[c] = acc * inv;
+    }
+    __syncthreads();
+    for (int v = tid; v < v_head; v += blockDim.x) {
+        const uint16_t* w = wv_b + (size_t) kv_lora * v + (size_t) kv_lora * v_head * h;
+        float acc = 0.0f;
+        for (int c = 0; c < kv_lora; ++c) acc += bf(w[c]) * ctx[c];
+        out[(size_t) v_head * h + v] = acc;
+    }
+}
+
+}  // namespace
+
+void dsa_rope_prep(const DsaRopePrepArgs& a, cudaStream_t s) {
+    dsa_rope_prep_kernel<<<a.ik_raw != nullptr ? 3 : 2, 1024, 0, s>>>(a);
+    launch_check("dsa_rope_prep");
+}
+
+void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base, cudaStream_t s) {
+    const int n = n_head * (n_rot / 2);
+    rope_heads_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, n_rot, stride, n_head, pos, base);
+    launch_check("rope_heads");
+}
+
+void mla_pe(const float* q, int k_mla, int qk_nope, int n_rot, const uint16_t* wk_b, const uint16_t* wv_b,
+            const uint16_t* lat, const float* kpe, const int* cells, int n_sel, int n_head, int kv_lora, int v_head,
+            float* scratch, void* out_q8_1, cudaStream_t s) {
+    float* q_abs = scratch;
+    float* out = scratch + (size_t) n_head * kv_lora;
+    mla_pe_qabs_kernel<<<(kv_lora * n_head + 255) / 256, 256, 0, s>>>(q, k_mla, qk_nope, wk_b, kv_lora, n_head, q_abs);
+    launch_check("mla_pe_qabs");
+    const size_t smem = ((size_t) n_sel + 2 * kv_lora + n_rot) * sizeof(float);
+    mla_pe_attend_kernel<<<n_head, 256, smem, s>>>(q_abs, q, k_mla, qk_nope, n_rot, lat, kpe, cells, n_sel, wv_b,
+                                                   kv_lora, v_head, out);
+    launch_check("mla_pe_attend");
+    strata::kernels::quantize_q8_1_rows(out, 1, (int64_t) n_head * v_head, out_q8_1, s);
 }
 
 }  // namespace strata::kernels::glmf

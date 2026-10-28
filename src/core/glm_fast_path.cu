@@ -726,7 +726,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.enorm = f32("nextn.enorm.weight");
             Ly.hnorm = f32("nextn.hnorm.weight");
             Ly.shnorm = f32("nextn.shared_head_norm.weight");
-        } else {
+        } else if (!g.dsa) {   // (glm-dsa: a plain residual, no hyper-connections)
             Ly.hc_attn_fn = b16("hc_attn_fn.weight");
             Ly.hc_ffn_fn = b16("hc_ffn_fn.weight");
             Ly.hc_attn_scale = f32("hc_attn_scale.weight");
@@ -759,9 +759,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.kv_a_norm = f32("attn_kv_a_norm.weight");
             Ly.k_norm_w = f32("indexer.k_norm.weight");
             Ly.k_norm_b = f32("indexer.k_norm.bias");
-            Ly.ape = f32("indexer_compressor_ape.weight");
+            if (!g.dsa) {   // (glm-dsa's indexer scores tokens: no compressor)
+                Ly.ape = f32("indexer_compressor_ape.weight");
+                Ly.idx_gate = b16("indexer_compressor_gate.weight");
+            }
             Ly.idx_k = b16("indexer.attn_k.weight");
-            Ly.idx_gate = b16("indexer_compressor_gate.weight");
             if (const auto xi = ws_map_.find(P + "indexer.attn_q_b.weight");
                 xi != ws_map_.end() && xi->second.type == strata::kernels::exl3::kTypeEXL3)
                 Ly.idx_q_b_x = xi->second;   // an EXL3 pack quantizes it
@@ -827,14 +829,14 @@ bool Glm5Model::fast_setup(std::string& err) {
     size_t need = 0;
     {
         // generous upper bound, carved below
-        need = (size_t) (4 * E + 64 + 32 * 26 + 128 + 6 * DI + 4 * 128 + 2 * DI + 2 * g.q_lora + 2 * g.kv_lora +
-                         4 * g.idx_key + 64 + (int64_t) g.n_head * g.qk_nope + (int64_t) g.idx_heads * g.idx_key +
+        need = (size_t) (4 * E + 64 + 32 * 26 + 128 + 6 * DI + 4 * 128 + 2 * DI + 2 * g.q_lora + 2 * (g.kv_lora + g.n_rot) +
+                         4 * g.idx_key + 64 + (int64_t) g.n_head * g.k_mla() + (int64_t) g.n_head * (g.kv_lora + g.v_head) + (int64_t) g.idx_heads * g.idx_key +
                          max_pools + g.n_sel_max() + 2 * g.n_expert + 2 * FF + 2 * g.n_ff_dense + 2 * E + 64) *
                    sizeof(float);
         need += (size_t) (E + DI + g.q_lora + (int64_t) g.n_head * g.v_head + FF + 8 * g.n_ff_exp + g.n_ff_dense + E) /
                 32 * q8;
         need += 64 * 256 + (size_t) (2 * NL * g.n_expert + NL * gf::kSpares) * sizeof(unsigned long long) +
-                8 * 16 + 4096 * 4 + 4 * 256 + (size_t) g.n_expert * 4 + 256 + 4 * 256;
+                8 * 16 + gf::kMaxEmbd * 4 + 4 * 256 + (size_t) g.n_expert * 4 + 256 + 4 * 256;
         need += (size_t) gf::kAhead * g.n_expert * sizeof(float) + 256 + (size_t) E * sizeof(float) + 256;
         need += (size_t) g.n_sel_max() * sizeof(int) + 256;   // slot_cells
     }
@@ -865,11 +867,12 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->qr_raw = fa_take(at, g.q_lora);
     F->qr = fa_take(at, g.q_lora);
     F->qr_q = fa_take_b(at, (size_t) g.q_lora / 32 * q8);
-    F->kv_raw = fa_take(at, g.kv_lora);
+    F->kv_raw = fa_take(at, g.kv_lora + g.n_rot);   // (glm-dsa: [latent | k_pe])
     F->ik_raw = fa_take(at, g.idx_key);
     F->ig_raw = fa_take(at, g.idx_key);
     F->iw = fa_take(at, g.idx_heads);
-    F->q = fa_take(at, (size_t) g.n_head * g.qk_nope);
+    F->q = fa_take(at, (size_t) g.n_head * g.k_mla());   // (glm-dsa: heads of [nope | rope])
+    if (g.dsa) F->qabs = fa_take(at, (size_t) g.n_head * (g.kv_lora + g.v_head));   // gf::mla_pe's scratch
     F->iq = fa_take(at, (size_t) g.idx_heads * g.idx_key);
     F->score = fa_take(at, (size_t) max_pools);
     F->cells = (int*) fa_take(at, (size_t) g.n_sel_max());
@@ -3018,7 +3021,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                                                       : std::max(2, (int) pin_cpus.size() - spare);
         }
     }
-    if (threads <= 0 || g.n_embd > 4096 || g.n_exp_used > 8) return true;
+    if (threads <= 0 || g.n_embd > gf::kMaxEmbd || g.n_exp_used > 8) return true;
     namespace kc = strata::kernels::cpu;
     F->cpu_fmt.assign(F->L.size(), kc::NativeFmt{});
     int il_cal = -1;
@@ -4586,7 +4589,7 @@ void Glm5Model::fast_service() {
                 // Quantize on the CPU only when this route actually has CPU fallback.
                 if (ne > 0) {
                     const auto cpu_t0 = std::chrono::steady_clock::now();
-                    float cpu_part[4096];
+                    float cpu_part[gf::kMaxEmbd];
                     fast_cpu_experts(rq->layer, ne, blob, w, rq->x, cpu_part);
                     for (int j = 0; j < g.n_embd; ++j) ans->part[j] += cpu_part[j];
                     F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
@@ -5608,8 +5611,132 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     return true;
 }
 
+// ---- glm-dsa (GLM-5.3): roped MLA over the token indexer's selection (ref/glm_dsa.py GlmDsa.attention).  F->x / xq
+// -> F->mixer.  A full indexer layer scores every visible token and keeps top_k (all of them while p + 1 <= top_k);
+// a shared one reuses the previous full layer's cells (F->cells, F->dsa_n_sel).
+bool Glm5Model::fast_dsa_rope(int il, int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    const auto& Ly = F->L[(size_t) il];
+    const bool full = g.indexer_full[(size_t) il] != 0;
+    const int n_vis = (int) p + 1;
+    const bool all = n_vis <= g.idx_top_k && gf::dsa_select_all_on();
+    gf::MvJob j[4];
+    int nj = 2;
+    j[0] = {Ly.q_a.q, F->xq, F->x, F->qr_raw, nullptr, 1.0f, Ly.q_a.type, g.n_embd, g.q_lora};
+    j[1] = {Ly.kv_a.q, F->xq, F->x, F->kv_raw, nullptr, 1.0f, Ly.kv_a.type, g.n_embd, g.kv_lora + g.n_rot};
+    if (full) {
+        j[nj++] = {Ly.idx_k, nullptr, F->x, F->ik_raw, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.idx_key};
+        if (!all)
+            j[nj++] = {Ly.idx_proj, nullptr, F->x, F->iw, nullptr, 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads)),
+                       gf::kTypeBF16, g.n_embd, g.idx_heads};
+    }
+    if (!gf::mv(j, nj, s)) { err = "glm fast: dsa projections"; return false; }
+    uint16_t* lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+    float* kpe = state_ + dsa_kpe_[(size_t) il];
+    float* ik = state_ + dsa_pool_[(size_t) il];
+    gf::DsaRopePrepArgs d;
+    d.qr_raw = F->qr_raw;
+    d.q_a_norm = Ly.q_a_norm;
+    d.qr = F->qr;
+    d.qr_q = F->qr_q;
+    d.q_lora = g.q_lora;
+    d.kv_raw = F->kv_raw;
+    d.kv_norm = Ly.kv_a_norm;
+    d.lat = lat;
+    d.kpe = kpe;
+    d.kv_lora = g.kv_lora;
+    d.n_rot = g.n_rot;
+    d.ik_raw = full ? F->ik_raw : nullptr;
+    d.k_norm_w = Ly.k_norm_w;
+    d.k_norm_b = Ly.k_norm_b;
+    d.ik = ik;
+    d.idx_key = g.idx_key;
+    d.p = (int) p;
+    d.base = g.rope_base;
+    d.eps = g.norm_eps;
+    d.ln_eps = g.idx_ln_eps;
+    gf::dsa_rope_prep(d, s);
+    gf::MvJob j2[2];
+    j2[0] = {Ly.q_b.q, F->qr_q, F->qr, F->q, nullptr, 1.0f, Ly.q_b.type, g.q_lora, g.n_head * g.k_mla()};
+    j2[1] = {Ly.idx_q_b, nullptr, F->qr, F->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora, g.idx_heads * g.idx_key};
+    if (!gf::mv(j2, full && !all ? 2 : 1, s)) { err = "glm fast: dsa q"; return false; }
+    gf::rope_heads(F->q + g.qk_nope, g.n_rot, g.k_mla(), g.n_head, (int) p, g.rope_base, s);
+    if (full) {
+        F->dsa_n_sel = std::min(g.idx_top_k, n_vis);
+        if (all) {
+            gf::dsa_select_all(n_vis, 1, F->dsa_n_sel, (int) p, F->cells, s);
+        } else {
+            gf::rope_heads(F->iq, g.n_rot, g.idx_key, g.idx_heads, (int) p, g.rope_base, s);
+            gf::dsa_score(F->iq, ik, F->iw, g.idx_key, g.idx_heads, n_vis, F->score, s, true);
+            gf::dsa_select(F->score, n_vis, 1, F->dsa_n_sel, F->dsa_n_sel, (int) p, F->cells, s);
+        }
+    } else if (F->dsa_n_sel <= 0) {
+        err = "glm fast: glm-dsa layer " + std::to_string(il) + " shares an indexer selection this part never made";
+        return false;
+    }
+    gf::mla_pe(F->q, g.k_mla(), g.qk_nope, g.n_rot, Ly.k_b, Ly.v_b, lat, kpe, F->cells, F->dsa_n_sel, g.n_head,
+               g.kv_lora, g.v_head, F->qabs, F->attn_q, s);
+    if (dumps) fast_dump(s, "kqv_out-" + std::to_string(il), F->qabs + (size_t) g.n_head * g.kv_lora,
+                         (int64_t) g.n_head * g.v_head);
+    gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head, g.n_embd};
+    if (!gf::mv(&o, 1, s)) { err = "glm fast: dsa output"; return false; }
+    return true;
+}
+
+// the residual add the last layer leaves (glm-dsa's plain residual: R += ffn)
+static __global__ void dsa_add_kernel(float* __restrict__ h, const float* __restrict__ add, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) h[i] += add[i];
+}
+
+// ---- the glm-dsa layers [l0_, l1_): a plain pre-norm residual (state_ is the one stream) around the roped-MLA mixer and
+// the FFN (dense or the trunk's own fast_moe); the CPU lane's experts are waited for inside the layer (no deferral)
+bool Glm5Model::fast_layers_dsa(int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    bool pf_pending = false;
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        gf::rms_q8(state_, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        if (dumps) {
+            if (il != l0_) fast_dump(s, "l_out-" + std::to_string(il - 1), state_, g.n_embd);
+            fast_dump(s, "attn_norm-" + std::to_string(il), F->x, g.n_embd);
+        }
+        if (!fast_dsa_rope(il, p, err)) return false;
+        gf::rms_q8(state_, F->mixer, Ly.ffn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        if (dumps) fast_dump(s, "ffn_inp-" + std::to_string(il), state_, g.n_embd);
+        if (!Ly.moe) {
+            gf::MvJob j[2];
+            j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, g.n_ff_dense};
+            j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, g.n_ff_dense};
+            if (!gf::mv(j, 2, s)) { err = "glm fast: dense ffn"; return false; }
+            gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, g.n_ff_dense, F->dhq, s);
+            gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
+                            g.n_embd};
+            if (!gf::mv(&dn, 1, s)) { err = "glm fast: dense ffn down"; return false; }
+        } else if (!fast_moe(il, pf_pending, err, true)) {
+            return false;
+        }
+        if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
+    }
+    dsa_add_kernel<<<(g.n_embd + 255) / 256, 256, 0, s>>>(state_, F->ffn, g.n_embd);
+    if (dumps) fast_dump(s, "l_out-" + std::to_string(l1_ - 1), state_, g.n_embd);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        err = std::string("glm fast: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
 bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     (void) hop_in;
+    if (g_.dsa) return fast_layers_dsa(p, err);
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -5826,7 +5953,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
                  g.n_embd);
     if (const float* img = image_row(p)) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
-    gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+    if (g.dsa)   // glm-dsa: one residual stream
+        cudaMemcpyAsync(state_, F->emb, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+    else
+        gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
     if (!fast_layers(p, false, err)) return false;
     // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
     // copy ordered on the devices by an event (the host never waits between the parts)
@@ -5847,8 +5977,12 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     FastState* FT = tail->fast_;
     cudaSetDevice(tail->dev_);
-    gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
-                  FT->cs);
+    if (g.dsa)
+        gf::rms_q8(tail->state_, nullptr, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x,
+                   FT->head_xq, FT->cs);
+    else
+        gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
+                      FT->cs);
     // GLM_DUMP_H=<file> (debug): append every position's final hidden state (output_norm of the stream mean - what the
     // NextN/MTP block reads) as n_embd floats
     static const char* dh = getenv("GLM_DUMP_H");

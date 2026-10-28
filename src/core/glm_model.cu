@@ -2054,6 +2054,17 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // two-part split (default 1), STRATA_GLM_DEVS the devices of any split.
     const char* sp = getenv("STRATA_GLM_SPLIT");
     const std::string spec = sp != nullptr ? std::string(sp) : layer_split;
+    // the model's geometry before any part loads: the boundaries are checked against its layer count (they were checked
+    // against the default 45 - GLM-5.3-Flash's - so a 78-layer GLM-5.3 split was refused)
+    {
+        std::vector<std::string> sn;
+        std::string ge;
+        if (pack_shard_names(pack_dir, sn, ge)) {
+            strata::GgufFile gg(pack_dir + "/../" + sn[0]);
+            Glm5Geometry gt;
+            if (Glm5Geometry::from_gguf(gg, gt, ge)) g_ = gt;
+        }
+    }
     // STRATA_GLM_EXPERT_HELPER=<device>: the expert helper - alone beside one trunk GPU (no split: dense, state and
     // MTP stay on device 0), or beside a layer split, which then leaves the helper's device out and gives each part
     // its own share of the helper over its own layers (fast_helper_setup): two cards and a Ryzen AI Max APU
@@ -2113,6 +2124,11 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     }
     if (devs.size() == 2 && getenv("STRATA_GLM_DEVS") == nullptr && !spec.empty() && spec != "auto")
         if (const char* d1 = getenv("STRATA_GLM_DEV1")) devs[1] = std::atoi(d1);
+    // glm-dsa: a part starts on a FULL indexer layer (a shared one reuses a selection only its own part made) - each
+    // boundary moves down to the nearest full layer
+    if (g_.dsa)
+        for (int& b : bounds)
+            while (b > 1 && b < g_.n_layers && !g_.indexer_full[(size_t) b]) --b;
     bool ok = devs.size() == bounds.size() + 1;
     for (size_t i = 0; ok && i < bounds.size(); ++i)
         ok = bounds[i] >= 1 && bounds[i] < g_.n_layers && (i == 0 || bounds[i] > bounds[i - 1]);
@@ -3202,17 +3218,25 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // token_embd stays QUANTIZED too (Q4_K, 0.36 GB instead of 2.54 GB F32): step() dequantizes
     // the one row it needs per token from the host mapping (pack_emb_*), and the 2.2 GB go to
     // the expert pool instead
+    // glm-dsa on the fast path: the router, the indexer's projections and the absorbed MLA projections become the BF16
+    // copies the fast kernels read (glm5-next ships them BF16; glm-dsa F32 / Q8_0) - rounded to nearest even, as
+    // glm5-next's router already is
+    const auto dsa16 = [&](const std::string& name) {
+        if (!g_.dsa || !fast_mode_) return false;
+        for (const char* suf : {".ffn_gate_inp.weight", ".indexer.proj.weight", ".indexer.attn_k.weight",
+                                ".indexer.attn_q_b.weight", ".attn_k_b.weight", ".attn_v_b.weight"}) {
+            const size_t n = std::strlen(suf);
+            if (name.size() >= n && name.compare(name.size() - n, n, suf) == 0) return true;
+        }
+        return false;
+    };
     const auto dequant_at_load = [&](const std::string& name) {
-        return row_kind_[name] != "0" || is_absorbed_mla(name);
+        return row_kind_[name] != "0" || is_absorbed_mla(name) || dsa16(name);
     };
     // the fast path keeps the pack's BIG BF16 rows as BF16 on the device (dense.bin stores them BF16,
     // so this is lossless; F32 expansion doubled their bytes and their read time) and does not upload
     // token_embd at all (the embedding row is dequantized on the host from the shard mapping)
     fast_mode_ = getenv("STRATA_GLM_SLOW") == nullptr;
-    if (g_.dsa && fast_mode_) {
-        err = "pack: GLM-5.3 (glm-dsa) runs on the reference path only so far - set MAYA_GLM_SLOW=1";
-        return false;
-    }
     if (exl3_ && !fast_mode_) {
         err = "pack: an EXL3 model runs on the fast path only (unset MAYA_GLM_SLOW)";
         return false;
@@ -3436,6 +3460,16 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             err = "pack: unsupported dense kind '" + r.kind + "' for " + r.name;
             return false;
         }
+        if (dsa16(r.name)) {
+            std::vector<uint16_t> h16((size_t) n_f32);
+            const uint32_t* u = (const uint32_t*) host.data();
+            for (size_t i = 0; i < (size_t) n_f32; ++i) h16[i] = (uint16_t) ((u[i] + 0x7FFFu + ((u[i] >> 16) & 1u)) >> 16);
+            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, h16.data(), (size_t) n_f32 * 2,
+                                cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
+            at += (n_f32 * 2 + 255u) & ~(uint64_t) 255u;
+            continue;
+        }
         { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, host.data(), (size_t) n_f32 * 4,
                             cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
         w_[r.name] = (const float*) ((uint8_t*) w_arena_ + at);
@@ -3558,11 +3592,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     int64_t floats = 2 * hc_dim;
     // the fast path keeps the DSA latent cache in FP16 (half the bytes: at 128k context ~0.8 GB more for experts on
     // each card, and the prompt attention reads half as much); the reference path (STRATA_GLM_SLOW) keeps F32
-    lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && getenv("STRATA_GLM_KV_INT8") != nullptr &&
+    lat_q8_ = fast_mode_ && !g_.dsa && g_.kv_lora % 32 == 0 && getenv("STRATA_GLM_KV_INT8") != nullptr &&
               std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0;
     // KV streaming (--kv-resident N): the latent cache lives in pinned RAM and the state holds N positions of VRAM slots
     // a layer (kv_stream_setup, below)
-    const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;
+    const int64_t kv_cells = fast_mode_ && !g_.dsa ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;   // (glm-dsa: not yet)
     const int64_t lat_rows = kv_cells > 0 ? kv_cells : max_ctx;
     // (INT8: lat8_rec_bytes per position, a multiple of 16 bytes at kv_lora 512)
     const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
@@ -3598,9 +3632,9 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;
             kda_conv_[(size_t) il] = floats;
             floats += (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
-        } else if (g_.dsa) {   // (the reference path: F32 latent, k_pe and indexer keys of every position)
+        } else if (g_.dsa) {   // the latent (FP16 on the fast path), F32 k_pe and indexer keys of every position
             dsa_lat_[(size_t) il] = floats;
-            floats += (int64_t) g_.kv_lora * max_ctx;
+            floats += lat_floats;
             dsa_kpe_[(size_t) il] = floats;
             floats += (int64_t) g_.n_rot * max_ctx;
             dsa_pool_[(size_t) il] = floats;
