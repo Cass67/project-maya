@@ -36,7 +36,33 @@ size_t argmax(const float* v, size_t n) { return (size_t) (std::max_element(v, v
 
 }  // namespace
 
+// --pack DIR IDS OUT: a REAL pack (MAYA_GLM_SLOW=1) fed the comma-separated token ids one at a time; every
+// position's logits (n_vocab f32) appended to OUT - for the real-model check against ref/glm_dsa.py and llama.cpp
+static int probe_pack(const std::string& dir, const std::string& ids, const std::string& out) {
+    std::vector<int32_t> tokens;
+    for (size_t at = 0; at < ids.size();) {
+        const size_t c = ids.find(',', at);
+        tokens.push_back((int32_t) std::stol(ids.substr(at, c - at)));
+        at = c == std::string::npos ? ids.size() : c + 1;
+    }
+    strata::core::Glm5Model model;
+    std::string err;
+    require(model.load_pack_env(dir, 256, err), "load_pack: " + err);
+    FILE* f = std::fopen(out.c_str(), "wb");
+    require(f != nullptr, "cannot write " + out);
+    for (int32_t tok : tokens) {
+        std::vector<float> lg;
+        require(model.forward({tok}, lg, err), "forward: " + err);
+        std::fwrite(lg.data(), sizeof(float), lg.size(), f);
+        std::printf("pos %lld token %d argmax %zu\n", (long long) model.position() - 1, tok, argmax(lg.data(), lg.size()));
+        std::fflush(stdout);
+    }
+    std::fclose(f);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 5 && std::string(argv[1]) == "--pack") return probe_pack(argv[2], argv[3], argv[4]);
     if (argc < 2 || std::string(argv[1]) != "--selftest") {
         std::fprintf(stderr, "glm_dsa_model_test: run with --selftest (the CTest form)\n");
         return 2;
