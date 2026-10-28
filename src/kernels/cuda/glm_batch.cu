@@ -1781,8 +1781,10 @@ __device__ __forceinline__ int mla2_wmma_row(int i, int hi) {
 __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
         const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
         const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
-        int n_sel_max, int n_head, float scale, float* __restrict__ ctx, bool q8) {
+        int n_sel_max, int n_head, float scale, float* __restrict__ ctx, bool q8,
+        const float* __restrict__ q_pe, int q_pe_hs, const float* __restrict__ kpe, int n_rot) {
     __shared__ __align__(16) _Float16 sl[16][512];
+    __shared__ float sqpe[16][64];   // glm-dsa: the 16 heads' roped query part (n_rot <= 64)
     __shared__ __align__(16) _Float16 ph[16][16], pl[16][16];
     __shared__ float scores[8][16][16], qi[8][16];
     __shared__ float sm[16], denom[16], rescale[16];
@@ -1809,6 +1811,9 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
         }
     mla2_f8 acc[4] = {};
     if (tid < 16) { sm[tid] = -INFINITY; denom[tid] = 0; }
+    if (q_pe != nullptr)
+        for (int i = tid; i < 16 * n_rot; i += 256)
+            sqpe[i / n_rot][i % n_rot] = q_pe[((size_t)t * n_head + h0 + i / n_rot) * q_pe_hs + i % n_rot];
     for (int s0 = 0; s0 < ns; s0 += 16) {
         __syncthreads();
         if (tid < 16) cells[tid] = s0 + tid < ns ? cl[s0 + tid] : -1;
@@ -1837,6 +1842,10 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
         float v = 0;
 #pragma unroll
         for (int w = 0; w < 8; ++w) v += scores[w][r][col];
+        if (q_pe != nullptr && cells[col] >= 0) {
+            const float* kr = kpe + (size_t)cells[col] * n_rot;
+            for (int e = 0; e < n_rot; ++e) v += sqpe[r][e] * kr[e];
+        }
         v = cells[col] < 0 ? -INFINITY : v * scale;
         float m = v;
 #pragma unroll
@@ -2614,14 +2623,20 @@ bool mla_wmma2_supported() { const int a = mla_wmma2_arch(); return a == 1 || a 
 bool mla_wmma2_default() { const int a = mla_wmma2_arch(); return a == 1 || a == 4; }
 
 void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
-                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
+                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8,
+                    const float* q_pe, int q_pe_hs, const float* kpe, int n_rot) {
     if (T <= 0) return;
     if (kv_lora != 512 || n_head % 16 != 0) {
         std::fprintf(stderr, "glm_batch mla_attn_wmma2: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
         return;
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head / 16));
-    mla_attn_wmma2_kernel<<<grid, 256, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+    if (q_pe != nullptr && (n_rot <= 0 || n_rot > 64 || kpe == nullptr)) {
+        std::fprintf(stderr, "glm_batch mla_attn_wmma2: n_rot %d unsupported\n", n_rot);
+        return;
+    }
+    mla_attn_wmma2_kernel<<<grid, 256, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8, q_pe,
+                                               q_pe_hs, kpe, n_rot);
     check("mla_attn_wmma2");
 }
 #endif
