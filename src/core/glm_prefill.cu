@@ -243,7 +243,7 @@ DsaBufs carve_dsa(Carve& c, size_t T, const Glm5Geometry& g, int max_pools) {
     b.cells = c.take<int>(T * (size_t) g.n_sel_max());
     b.n_sel = c.take<int>(T);
     b.score_ld = std::max(1, max_pools);
-    b.score = g.dsa ? nullptr : c.take<float>(T * (size_t) b.score_ld);   // (glm-dsa scores a row at a time)
+    b.score = c.take<float>(T * (size_t) b.score_ld);
     b.q_abs = c.take<float>(T * (size_t) g.n_head * g.kv_lora);
     b.ctx = c.take<float>(T * (size_t) g.n_head * g.kv_lora);
     b.attn = c.take<float>(T * (size_t) g.n_head * g.v_head);
@@ -2565,23 +2565,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             gf::rope_heads(B.q + g.qk_nope, g.n_rot, g.k_mla(), g.n_head, pt, g.rope_base, s, tn, HQ);
             S->mark("dsa_proj", s);
             if (full) {
-                // a row whose every position fits the top-k takes them all (dsa_select_all, as the token path)
-                const bool all_on = gf::dsa_select_all_on();
-                if (!all_on || pt + tn > KS) {
+                // the token path's selection (a token is its own pool): every position while they fit the top-k, in
+                // order; past it the stable top-k of the scores (gb::dsa_select's rows take dsa_select's top_pools)
+                if (pt + tn > KS) {
                     sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq,
                                g.idx_heads * g.idx_key, tn, 1.0f);
                     gf::rope_heads(B.iq, g.n_rot, g.idx_key, g.idx_heads, pt, g.rope_base, s, tn, g.idx_heads * g.idx_key);
+                    gb::dsa_score(B.iq, ik, B.iw, g.idx_key, g.idx_heads, pt, 1, tn, pt + tn, B.score, B.score_ld, s);
                 }
-                for (int t = 0; t < tn; ++t) {
-                    const int p = pt + t, n_vis = p + 1, n_sel = std::min(KS, n_vis);
-                    if (all_on && n_vis <= KS) {
-                        gf::dsa_select_all(n_vis, 1, n_sel, p, cells + (size_t) t * KS, s);
-                    } else {
-                        gf::dsa_score(B.iq + (size_t) t * g.idx_heads * g.idx_key, ik, B.iw + (size_t) t * g.idx_heads,
-                                      g.idx_key, g.idx_heads, n_vis, F->score, s);
-                        gf::dsa_select(F->score, n_vis, 1, n_sel, n_sel, p, cells + (size_t) t * KS, s);
-                    }
-                }
+                gb::dsa_select(B.score, B.score_ld, pt, 1, KS, 0, tn, KS, cells, B.n_sel, s);
                 dsa_sel = true;
                 S->mark("dsa_index", s);
             }
