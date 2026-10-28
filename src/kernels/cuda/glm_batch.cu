@@ -1941,11 +1941,11 @@ __global__ void __launch_bounds__(256) mtp_in_rows_kernel(const float* __restric
                                                           __half* __restrict__ out) {
     __shared__ float sred[32];
     const int t = blockIdx.x, tid = threadIdx.x;
-    float a[16], b[16];
+    float a[32], b[32];
     float sa = 0.0f, sb = 0.0f;
     const int per = E / (int) blockDim.x;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         a[i] = emb[(size_t) t * E + e];
@@ -1957,7 +1957,7 @@ __global__ void __launch_bounds__(256) mtp_in_rows_kernel(const float* __restric
     sb = block_sum(sb, sred);
     const float ia = rsqrtf(sa / (float) E + eps), ib = rsqrtf(sb / (float) E + eps);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         out[(size_t) t * 2 * E + e] = __float2half(a[i] * ia * enorm[e]);
@@ -1969,11 +1969,11 @@ __global__ void __launch_bounds__(256) rms_rows_kernel(const float* __restrict__
                                                        int E, float* __restrict__ x, __half* __restrict__ x16) {
     __shared__ float sred[32];
     const int t = blockIdx.x, tid = threadIdx.x;
-    float v[16];
+    float v[32];
     float ss = 0.0f;
     const int per = E / (int) blockDim.x;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         v[i] = in[(size_t) t * E + e];
@@ -1982,7 +1982,7 @@ __global__ void __launch_bounds__(256) rms_rows_kernel(const float* __restrict__
     ss = block_sum(ss, sred);
     const float inv = rsqrtf(ss / (float) E + eps);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         const float xv = v[i] * inv * w[e];

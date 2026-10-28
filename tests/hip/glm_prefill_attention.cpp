@@ -41,7 +41,70 @@ static std::vector<uint8_t> int8_latents(const std::vector<uint16_t>& lat, int k
     return packed;
 }
 
+// The full model is 6144-wide. Compare both batch normalization sites with
+// a double-precision CPU oracle, including the tail past the old 4096 limit.
+static int wide_norms() {
+    namespace gb = strata::kernels::glmb;
+    for (int E : {4096, 6144, 8192}) {
+        const int T = 3;
+        const float eps = 1e-5f;
+        std::vector<float> x(T * E), h(T * E), w(E), got(T * E);
+        std::vector<uint16_t> half(T * 2 * E);
+        for (int i = 0; i < T * E; ++i) {
+            x[i] = std::sin(i * 0.017f);
+            h[i] = std::cos(i * 0.013f);
+        }
+        for (int i = 0; i < E; ++i) w[i] = 0.8f + 0.2f * std::sin(i * 0.031f);
+        float *dx = nullptr, *dh = nullptr, *dw = nullptr, *dy = nullptr;
+        uint16_t* dq = nullptr;
+        CHECK(hipMalloc((void**) &dx, x.size() * sizeof(float)));
+        CHECK(hipMalloc((void**) &dh, h.size() * sizeof(float)));
+        CHECK(hipMalloc((void**) &dw, w.size() * sizeof(float)));
+        CHECK(hipMalloc((void**) &dy, got.size() * sizeof(float)));
+        CHECK(hipMalloc((void**) &dq, half.size() * sizeof(uint16_t)));
+        CHECK(hipMemcpy(dx, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice));
+        CHECK(hipMemcpy(dh, h.data(), h.size() * sizeof(float), hipMemcpyHostToDevice));
+        CHECK(hipMemcpy(dw, w.data(), w.size() * sizeof(float), hipMemcpyHostToDevice));
+        CHECK(hipMemset(dy, 0xff, got.size() * sizeof(float)));
+        gb::rms_rows(dx, dw, eps, T, E, dy, dq, nullptr);
+        CHECK(hipDeviceSynchronize());
+        CHECK(hipMemcpy(got.data(), dy, got.size() * sizeof(float), hipMemcpyDeviceToHost));
+        double worst = 0;
+        for (int t = 0; t < T; ++t) {
+            double ss = 0;
+            for (int e = 0; e < E; ++e) ss += double(x[t * E + e]) * x[t * E + e];
+            for (int e = 0; e < E; ++e) {
+                const double ref = x[t * E + e] * w[e] / std::sqrt(ss / E + eps);
+                if (!std::isfinite(got[t * E + e])) return 4;
+                worst = std::max(worst, std::fabs(got[t * E + e] - ref));
+            }
+        }
+        CHECK(hipMemset(dq, 0xff, half.size() * sizeof(uint16_t)));
+        gb::mtp_in_rows(dx, dh, dw, dw, eps, T, E, dq, nullptr);
+        CHECK(hipDeviceSynchronize());
+        CHECK(hipMemcpy(half.data(), dq, half.size() * sizeof(uint16_t), hipMemcpyDeviceToHost));
+        for (int t = 0; t < T; ++t) for (int k = 0; k < 2; ++k) {
+            const auto& a = k == 0 ? x : h;
+            double ss = 0;
+            for (int e = 0; e < E; ++e) ss += double(a[t * E + e]) * a[t * E + e];
+            for (int e = 0; e < E; ++e) {
+                __half q;
+                std::memcpy(&q, &half[t * 2 * E + k * E + e], 2);
+                const double v = __half2float(q);
+                const double ref = a[t * E + e] * w[e] / std::sqrt(ss / E + eps);
+                if (!std::isfinite(v)) return 4;
+                worst = std::max(worst, std::fabs(v - ref));
+            }
+        }
+        CHECK(hipFree(dx)); CHECK(hipFree(dh)); CHECK(hipFree(dw)); CHECK(hipFree(dy)); CHECK(hipFree(dq));
+        std::printf("wide normalization E=%d: worst error %.3g\n", E, worst);
+        if (worst > 0.002) return 4;
+    }
+    return 0;
+}
+
 int main() {
+    if (const int rc = wide_norms()) return rc;
     constexpr int T = 5, H = 32, KV = 512, rows = 67, stride = 37;
     const float scale = 1.0f / std::sqrt(128.0f);
     std::vector<float> q(T * H * KV), lat(rows * KV), got(q.size());
