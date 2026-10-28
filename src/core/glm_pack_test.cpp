@@ -39,7 +39,8 @@ int main(int argc, char** argv) {
 
     strata::core::Glm5Model model;
     std::string err;
-    if (!model.load_pack_env(pack, 4096, err)) {
+    const int64_t max_ctx = getenv("GLM_TEST_CTX") ? std::atoll(getenv("GLM_TEST_CTX")) : 4096;
+    if (!model.load_pack_env(pack, max_ctx, err)) {
         std::fprintf(stderr, "glm_pack_test: %s\n", err.c_str());
         return 1;
     }
