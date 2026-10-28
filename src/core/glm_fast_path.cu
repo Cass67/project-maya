@@ -5627,6 +5627,35 @@ void Glm5Model::head_res(const float* R, float* x, void* xq, cudaStream_t s) con
         gf::head_prep(R, w_.at("output_norm.weight"), g_.norm_eps, g_.n_embd, x, xq, s);
 }
 
+// glm-dsa's NextN prompt cache: h is output_norm of the trunk residual,
+// emb is the next token's device embedding. Match fast_mtp's quantization exactly,
+// without evaluating the draft queries, experts, or vocabulary head.
+bool Glm5Model::fast_mtp_cache_rope(int64_t p, const float* h, const float* emb, std::string& err) {
+    FastState* F = fast_;
+    const auto& g = g_;
+    const auto& Ly = F->L[(size_t) mtp_il_];
+    const int E = g.n_embd;
+    const cudaStream_t s = F->cs;
+    gf::mtp_in(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
+    gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
+    if (!gf::mv(&eh, 1, s)) { err = "glm NextN cache: eh_proj"; return false; }
+    gf::rms_q8(F->mtp_h, nullptr, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
+    gf::MvJob kv = {Ly.kv_a.q, F->xq, F->x, F->kv_raw, nullptr, 1.0f, Ly.kv_a.type, E, g.kv_lora + g.n_rot};
+    if (!gf::mv(&kv, 1, s)) { err = "glm NextN cache: kv_a"; return false; }
+    gf::DsaRopePrepArgs d;
+    d.kv_raw = F->kv_raw;
+    d.kv_norm = Ly.kv_a_norm;
+    d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+    d.kpe = state_ + dsa_kpe_[(size_t) mtp_il_];
+    d.kv_lora = g.kv_lora;
+    d.n_rot = g.n_rot;
+    d.base = g.rope_base;
+    d.eps = g.norm_eps;
+    d.p = (int) p;
+    gf::dsa_rope_prep(d, s);
+    return true;
+}
+
 // ---- glm-dsa (GLM-5.3): roped MLA over the token indexer's selection (ref/glm_dsa.py GlmDsa.attention).  F->x / xq
 // -> F->mixer.  A full indexer layer scores every visible token and keeps top_k (all of them while p + 1 <= top_k);
 // a shared one reuses the previous full layer's cells (F->cells, F->dsa_n_sel).
@@ -5959,7 +5988,24 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     // the one-GPU MTP decode's NextN cache: its entry p - 1 from the trunk's hidden state of p - 1 and this token (on
     // the part with the block, queued before this token's layers there)
-    if (last->mtp_dec_) {
+    if (g.dsa && last->mtp_il_ >= 0 && p > 0 && last->mtp_hx_pos_ == p - 1) {
+        // The multi-GPU speculative decoder needs the prompt's NextN cache too.
+        // An explicit mtp_draft already consumed h (mtp_hx_pos_ == -1); otherwise
+        // fill the previous position before this token overwrites the trunk head.
+        cudaSetDevice(last->dev_);
+        FastState* L = last->fast_;
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(L->cs), "glm NextN cache embedding", err)) return false;
+        const auto* tt = ggml_get_type_traits((ggml_type) last->pack_emb_type_);
+        if (tt == nullptr || tt->to_float == nullptr || last->pack_emb_src_ == nullptr) {
+            err = "glm NextN cache: no embedding dequantizer";
+            return false;
+        }
+        tt->to_float(last->pack_emb_src_ + (size_t) token * ggml_row_size((ggml_type) last->pack_emb_type_, g.n_embd),
+                     L->emb_h, g.n_embd);
+        cudaMemcpyAsync(L->emb, L->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, L->cs);
+        if (!last->fast_mtp_cache_rope(p - 1, L->head_x, L->emb, err)) return false;
+        last->mtp_hx_pos_ = -1;
+    } else if (last->mtp_dec_) {
         cudaSetDevice(last->dev_);
         if (!last->mtp_fill_prev(token, p, err)) return false;
         last->mtp_hx_pos_ = -1;

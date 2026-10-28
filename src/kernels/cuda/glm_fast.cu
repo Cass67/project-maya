@@ -7024,6 +7024,7 @@ __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) 
     __shared__ float sy[1024];
     const int tid = threadIdx.x, lane = tid & 31;
     if (blockIdx.x == 0) {   // qr = rms(qr_raw) * w, and its q8_1
+        if (a.qr_raw == nullptr) return;   // a batched NextN cache fill needs only the latent/k_pe
         float ss = 0.0f;
         for (int e = tid; e < a.q_lora; e += blockDim.x) ss += a.qr_raw[e] * a.qr_raw[e];
         const float inv = rsqrtf(block_sum(ss, sred) / (float) a.q_lora + a.eps);
