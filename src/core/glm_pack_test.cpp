@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,17 @@ int main(int argc, char** argv) {
     const std::string pack = argv[1];
     const int n_tok = std::atoi(argv[2]);
     const char* out_path = argc > 3 ? argv[3] : nullptr;
+
+    // The model's optional seam writers open files directly. Prepare the directory
+    // before the first forward, so a fresh diagnostic run cannot silently lose dumps.
+    if (const char* cb = getenv("GLM_CB_DIR"); cb != nullptr && cb[0]) {
+        std::error_code ec;
+        std::filesystem::create_directories(cb, ec);
+        if (ec) {
+            std::fprintf(stderr, "glm_pack_test: cannot create seam directory: %s\n", ec.message().c_str());
+            return 1;
+        }
+    }
 
     strata::core::Glm5Model model;
     std::string err;
@@ -96,6 +108,15 @@ int main(int argc, char** argv) {
     const int compare_prefill = getenv("GLM_TEST_COMPARE_PREFILL") ? std::atoi(getenv("GLM_TEST_COMPARE_PREFILL")) : 0;
     const auto serial_start = std::chrono::steady_clock::now();
     double serial_prefix_ms = 0;
+    const auto stash_seams = [](const char* name) {
+        const char* cb = getenv("GLM_CB_DIR");
+        if (cb == nullptr || !cb[0]) return;
+        const std::filesystem::path root(cb), out = root / name;
+        std::filesystem::create_directories(out);
+        for (const auto& entry : std::filesystem::directory_iterator(root))
+            if (entry.is_regular_file() && entry.path().extension() == ".f32")
+                std::filesystem::copy_file(entry.path(), out / entry.path().filename(), std::filesystem::copy_options::overwrite_existing);
+    };
     // GLM_TEST_PREFILL=k: the first k positions through the batched prompt path (model.prefill), the rest through
     // the token path as usual - the recorded rows then start at position k (compare against a plain run's tail)
     int t_first = 0;
@@ -146,8 +167,10 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("pos %d tok %d argmax %d (%.6f)\n", t, tok, am, lg[(size_t) am]);
-        if (t + 1 == compare_prefill)
+        if (t + 1 == compare_prefill) {
             serial_prefix_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - serial_start).count();
+            stash_seams("serial");
+        }
     }
     // A single load compares the new prompt path with the validated token path,
     // including the continuation and NextN drafts after the prefilled prefix.
@@ -160,17 +183,20 @@ int main(int argc, char** argv) {
         model.reset();
         const auto start = std::chrono::steady_clock::now();
         if (!model.prefill(prefix, err, token_at(k))) {
-            std::fprintf(stderr, "compare prefill: %s\n", err.c_str());
+            std::fprintf(stderr, "compare prefill: %s\n", err.empty() ? "batched prefill unavailable" : err.c_str());
             return 1;
         }
+        stash_seams("batch");
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         std::printf("compare prefill: %d tokens serial %.1f ms / %.2f tok/s; batch %.1f ms / %.2f tok/s\n",
                     k, serial_prefix_ms, k * 1000.0 / serial_prefix_ms, ms, k * 1000.0 / ms);
         double worst = 0, top20_sum = 0, top20_max = 0;
         int mismatches = 0, draft_mismatches = 0;
+        std::vector<float> batch_logits;
         for (int t = k; t < n_tok; ++t) {
             std::vector<float> lg;
             if (!model.forward({token_at(t)}, lg, err)) return 1;
+            if (out_path) batch_logits.insert(batch_logits.end(), lg.begin(), lg.end());
             const float* ref = all.data() + (size_t) t * V;
             const int a = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
             const int b = (int) (std::max_element(ref, ref + V) - ref);
@@ -204,6 +230,22 @@ int main(int argc, char** argv) {
         std::printf("compare prefill: continuation=%d max |dlogit|=%.6f argmax mismatches=%d MTP mismatches=%d\n",
                     n_tok - k, worst, mismatches, draft_mismatches);
         std::printf("compare prefill: top20 mean |dlogp|=%.6f max=%.6f\n", top20_sum / (20.0 * (n_tok - k)), top20_max);
+        // Keep both products even when the parity gate fails, so an independent
+        // oracle can distinguish numerical drift from an implementation error.
+        // The serial file contains n_tok rows; .prefill.bin contains only rows k..n_tok.
+        if (out_path) {
+            const auto save = [](const std::string& path, const std::vector<float>& rows) {
+                FILE* f = std::fopen(path.c_str(), "wb");
+                if (!f) return false;
+                const bool written = std::fwrite(rows.data(), sizeof(float), rows.size(), f) == rows.size();
+                const bool closed = std::fclose(f) == 0;
+                return written && closed;
+            };
+            if (!save(out_path, all) || !save(std::string(out_path) + ".prefill.bin", batch_logits)) {
+                std::fprintf(stderr, "compare prefill: cannot save oracle comparison logits\n");
+                return 1;
+            }
+        }
         if (getenv("GLM_TEST_DECODE_COMPARE")) {
             const int count = std::max(16, std::atoi(getenv("GLM_TEST_DECODE_COMPARE")));
             std::vector<int> serial_tokens;
