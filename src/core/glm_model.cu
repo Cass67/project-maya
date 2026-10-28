@@ -247,6 +247,17 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
 // a dense row's VRAM bytes as load_pack uploads it (0: not uploaded), and how: the fast path keeps the pack's big BF16
 // rows (kind 4) BF16 and the natively served rows (kind 0) quantized, dequantizes the rest to F32, and leaves
 // token_embd on the host (the embedding row is dequantized there from the shard mapping)
+// the 3-D absorbed MLA projections, which the runner indexes by row: dequantized to F32 at load even when the pack
+// serves them natively (glm-dsa ships them Q8_0).  (A whole-name compare against the bare suffix never matched a
+// blk.N. name - harmless while only glm5-next's BF16 rows reached here.)
+static bool is_absorbed_mla(const std::string& name) {
+    const auto ends = [&](const char* suf) {
+        const size_t n = std::strlen(suf);
+        return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
+    };
+    return ends(".attn_k_b.weight") || ends(".attn_v_b.weight");
+}
+
 static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
                               std::string* how = nullptr) {
     if (fast && name == "token_embd.weight") return 0;
@@ -254,7 +265,7 @@ static uint64_t pack_row_vram(const std::string& name, const std::string& kind, 
         if (how) *how = " bf16";
         return ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
     }
-    if (kind != "0" || name == "attn_k_b.weight" || name == "attn_v_b.weight") {
+    if (kind != "0" || is_absorbed_mla(name)) {
         if (how) *how = " f32";
         return ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
     }
@@ -3192,12 +3203,16 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // the one row it needs per token from the host mapping (pack_emb_*), and the 2.2 GB go to
     // the expert pool instead
     const auto dequant_at_load = [&](const std::string& name) {
-        return row_kind_[name] != "0" || name == "attn_k_b.weight" || name == "attn_v_b.weight";
+        return row_kind_[name] != "0" || is_absorbed_mla(name);
     };
     // the fast path keeps the pack's BIG BF16 rows as BF16 on the device (dense.bin stores them BF16,
     // so this is lossless; F32 expansion doubled their bytes and their read time) and does not upload
     // token_embd at all (the embedding row is dequantized on the host from the shard mapping)
     fast_mode_ = getenv("STRATA_GLM_SLOW") == nullptr;
+    if (g_.dsa && fast_mode_) {
+        err = "pack: GLM-5.3 (glm-dsa) runs on the reference path only so far - set MAYA_GLM_SLOW=1";
+        return false;
+    }
     if (exl3_ && !fast_mode_) {
         err = "pack: an EXL3 model runs on the fast path only (unset MAYA_GLM_SLOW)";
         return false;
@@ -3562,6 +3577,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     dsa_ik_.assign((size_t) g_.n_layers + 1, 0);
     dsa_ig_.assign((size_t) g_.n_layers + 1, 0);
     dsa_pool_.assign((size_t) g_.n_layers + 1, 0);
+    dsa_kpe_.assign((size_t) g_.n_layers + 1, 0);
     // the indexer key / gate caches: a ring on the fast path (the prompt path's largest sub-batch + 64 positions; see
     // ik_ring_), the whole context on the reference path (whose kernels index them by position)
     ik_ring_ = fast_mode_ ? (int) std::min<int64_t>(max_ctx, 8192 + 64) : (int) max_ctx;
@@ -3582,6 +3598,13 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;
             kda_conv_[(size_t) il] = floats;
             floats += (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
+        } else if (g_.dsa) {   // (the reference path: F32 latent, k_pe and indexer keys of every position)
+            dsa_lat_[(size_t) il] = floats;
+            floats += (int64_t) g_.kv_lora * max_ctx;
+            dsa_kpe_[(size_t) il] = floats;
+            floats += (int64_t) g_.n_rot * max_ctx;
+            dsa_pool_[(size_t) il] = floats;
+            floats += (int64_t) g_.idx_key * max_ctx;
         } else {
             dsa_lat_[(size_t) il] = floats;
             floats += lat_floats;

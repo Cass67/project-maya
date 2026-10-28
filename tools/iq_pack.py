@@ -96,10 +96,19 @@ GLM5NEXT_NATIVE_OK = (
     # dequantizes them into the F32 arena at load (2x ~1.2 GB quantized)
     "token_embd.weight", "output.weight",
 )
-ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next")   # unsloth spells it without the hyphen
+# glm-dsa (GLM-5.3, the 744B): no mHC, no KDA; its MLA's absorbed projections and its indexer ship Q8_0 in the
+# UD recipes and are served natively (k_b / v_b dequantized to F32 at load - exact, no BF16 rounding), the
+# norms, router and indexer proj stay F32.  Nothing is forced to BF16.
+GLMDSA_NATIVE_OK = GLM5NEXT_NATIVE_OK + (
+    "attn_k_b.weight", "attn_v_b.weight", "indexer.attn_q_b.weight", "indexer.attn_k.weight",
+)
+GLM_ARCHS = ("glm5-next", "glm5next", "glm-dsa")
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "glm-dsa")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
+    if arch == "glm-dsa":
+        return False
     if arch in ("glm5-next", "glm5next"):
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
         # as F32 by config), so ONLY the listed projections take the BF16 path.
@@ -222,7 +231,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
             # a trailing ne3 of 1 adds no bytes: some converters write glm5-next's conv weights as
             # [4, 1, 8192, 1] instead of [4, 1, 8192], and index_shape packs both as (4, 8192)
             dims = len(t.shape) - (len(t.shape) == 4 and int(t.shape[3]) == 1)
-            if dims > 2 and not (arch in ("glm5-next", "glm5next") and dims == 3):
+            if dims > 2 and not (arch in GLM_ARCHS and dims == 3):
                 print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
                 return 1
             ne0, ne1 = index_shape(t.shape)
@@ -248,9 +257,9 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 pad = (-len(raw)) % ALIGN
                 fo.write(b"\0" * pad)
                 at += len(raw) + pad
-            elif arch in ("glm5-next", "glm5next") and not name.endswith(GLM5NEXT_NATIVE_OK):
-                print("%s is %s: not on the BF16 upgrade list nor the glm5-next native set "
-                      "(GLM5NEXT_NATIVE_OK); refusing to pack it silently" % (t.name, t.type_name))
+            elif arch in GLM_ARCHS and not name.endswith(GLMDSA_NATIVE_OK if arch == "glm-dsa" else GLM5NEXT_NATIVE_OK):
+                print("%s is %s: not on the BF16 upgrade list nor the %s native set; refusing to pack it "
+                      "silently" % (t.name, t.type_name, arch))
                 return 1
             else:
                 served += 1
@@ -361,6 +370,9 @@ def main() -> int:
     if arch not in ARCHITECTURES:
         print("general.architecture is %r; the packer knows %s" % (arch, " and ".join(ARCHITECTURES)))
         return 1
+    if arch == "glm-dsa":
+        prefix = "glm-dsa."
+        print("glm-dsa: packing GLM-5.3 for the Glm5Model runner (quantized dense served natively)")
     if arch in ("glm5-next", "glm5next"):
         # two spellings in the wild: llama.cpp's canonical "glm5-next" (llama-arch.cpp L156) and
         # unsloth's "glm5next" - the KV PREFIX follows the same spelling, so it is read per file
@@ -370,9 +382,9 @@ def main() -> int:
     block_count = None
     trunk = None
     # (a Qwen GGUF with its MTP block - qwen4exp, nextn_predict_layers 1, block_count 49 - the same: the trunk only)
-    if arch not in ("glm5-next", "glm5next"):
+    if arch not in GLM_ARCHS:
         prefix = arch + "."
-    if arch in ("glm5-next", "glm5next") or int(g.metadata.get(prefix + "nextn_predict_layers", 0) or 0) > 0:
+    if arch in GLM_ARCHS or int(g.metadata.get(prefix + "nextn_predict_layers", 0) or 0) > 0:
         bc = g.metadata.get(prefix + "block_count")
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -421,7 +433,7 @@ def main() -> int:
     else:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
-    if arch in ("glm5-next", "glm5next"):
+    if arch in GLM_ARCHS:
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
     else:
         lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)
