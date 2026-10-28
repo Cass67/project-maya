@@ -6,6 +6,7 @@
 // runner and writes the (T, vocab) float32 logits.  The cross-check is llama.cpp on the same
 // GGUF (llm_logits_dump) - docs/GLM5-FLASH.md §9.
 #include "strata/core/glm_model.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -91,6 +92,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "glm_pack_test: warmed (%s passes)\n", wv);
     }
     std::vector<float> all;
+    std::vector<int> draft_ids;
+    const int compare_prefill = getenv("GLM_TEST_COMPARE_PREFILL") ? std::atoi(getenv("GLM_TEST_COMPARE_PREFILL")) : 0;
+    const auto serial_start = std::chrono::steady_clock::now();
+    double serial_prefix_ms = 0;
     // GLM_TEST_PREFILL=k: the first k positions through the batched prompt path (model.prefill), the rest through
     // the token path as usual - the recorded rows then start at position k (compare against a plain run's tail)
     int t_first = 0;
@@ -137,9 +142,118 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "glm_pack_test: mtp at %d: %s\n", t, err.c_str());
                     return 1;
                 }
+                draft_ids.push_back(draft_prev);
             }
         }
         std::printf("pos %d tok %d argmax %d (%.6f)\n", t, tok, am, lg[(size_t) am]);
+        if (t + 1 == compare_prefill)
+            serial_prefix_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - serial_start).count();
+    }
+    // A single load compares the new prompt path with the validated token path,
+    // including the continuation and NextN drafts after the prefilled prefix.
+    if (compare_prefill > 0) {
+        const int k = compare_prefill;
+        if (t_first != 0 || k >= n_tok) return 2;
+        const auto token_at = [&](int t) { return !ids.empty() ? ids[(size_t) t % ids.size()] : (int32_t) ((t % 511) + 1); };
+        std::vector<int32_t> prefix;
+        for (int t = 0; t < k; ++t) prefix.push_back(token_at(t));
+        model.reset();
+        const auto start = std::chrono::steady_clock::now();
+        if (!model.prefill(prefix, err, token_at(k))) {
+            std::fprintf(stderr, "compare prefill: %s\n", err.c_str());
+            return 1;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        std::printf("compare prefill: %d tokens serial %.1f ms / %.2f tok/s; batch %.1f ms / %.2f tok/s\n",
+                    k, serial_prefix_ms, k * 1000.0 / serial_prefix_ms, ms, k * 1000.0 / ms);
+        double worst = 0, top20_sum = 0, top20_max = 0;
+        int mismatches = 0, draft_mismatches = 0;
+        for (int t = k; t < n_tok; ++t) {
+            std::vector<float> lg;
+            if (!model.forward({token_at(t)}, lg, err)) return 1;
+            const float* ref = all.data() + (size_t) t * V;
+            const int a = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+            const int b = (int) (std::max_element(ref, ref + V) - ref);
+            mismatches += a != b;
+            for (size_t v = 0; v < V; ++v) {
+                if (!std::isfinite(lg[v])) return 1;
+                worst = std::max(worst, (double) std::fabs(lg[v] - ref[v]));
+            }
+            std::vector<size_t> ranked(V);
+            for (size_t v = 0; v < V; ++v) ranked[v] = v;
+            std::partial_sort(ranked.begin(), ranked.begin() + 20, ranked.end(), [&](size_t a, size_t b) { return ref[a] > ref[b]; });
+            const auto lse = [&](const float* x) {
+                const double mx = *std::max_element(x, x + V);
+                double sum = 0;
+                for (size_t v = 0; v < V; ++v) sum += std::exp((double) x[v] - mx);
+                return mx + std::log(sum);
+            };
+            const double lr = lse(ref), lb = lse(lg.data());
+            for (int j = 0; j < 20; ++j) {
+                const size_t v = ranked[(size_t) j];
+                const double delta = std::fabs((lg[v] - lb) - (ref[v] - lr));
+                top20_sum += delta; top20_max = std::max(top20_max, delta);
+            }
+            if (mtp_probe && t + 1 < n_tok) {
+                const int d = model.mtp_draft(token_at(t + 1), err);
+                if (d < 0) return 1;
+                draft_mismatches += d != draft_ids[(size_t) t];
+                std::printf("compare draft position=%d serial=%d batch=%d\n", t, draft_ids[(size_t) t], d);
+            }
+        }
+        std::printf("compare prefill: continuation=%d max |dlogit|=%.6f argmax mismatches=%d MTP mismatches=%d\n",
+                    n_tok - k, worst, mismatches, draft_mismatches);
+        std::printf("compare prefill: top20 mean |dlogp|=%.6f max=%.6f\n", top20_sum / (20.0 * (n_tok - k)), top20_max);
+        if (getenv("GLM_TEST_DECODE_COMPARE")) {
+            const int count = std::max(16, std::atoi(getenv("GLM_TEST_DECODE_COMPARE")));
+            std::vector<int> serial_tokens;
+            const auto bench = [&](const char* name, bool spec, int threads, double pcie) -> bool {
+                model.set_cpu_lane_threads(threads);
+                model.set_pcie_share(pcie);
+                model.reset();
+                std::vector<int32_t> head(prefix.begin(), prefix.end() - 1);
+                std::vector<float> lg;
+                if (!model.forward(head, lg, err)) return false;   // diagnostic does not depend on experimental prefill
+                if (!model.forward({prefix.back()}, lg, err)) return false;
+                model.set_follow(spec ? std::vector<int32_t>(serial_tokens.begin(), serial_tokens.end()) : std::vector<int32_t>{});
+                strata::kernels::SamplerParams sp;
+                sp.temperature = 0; sp.greedy = true;
+                std::vector<int> generated;
+                const auto before = model.fast_stats();
+                const uint64_t offers = model.spec_steps_, accepts = model.spec_hits_;
+                const auto begin = std::chrono::steady_clock::now();
+                if (spec) {
+                    int64_t produced = 0;
+                    if (!model.decode_spec(sp, count, [&](int tok) { generated.push_back(tok); return true; }, produced, err)) return false;
+                } else {
+                    for (int i = 0; i < count; ++i) {
+                        const int tok = model.sample_token(sp, err);
+                        if (tok < 0) return false;
+                        generated.push_back(tok);
+                        if (i + 1 < count && !model.forward({tok}, lg, err)) return false;
+                    }
+                    serial_tokens = generated;
+                }
+                const double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+                const auto after = model.fast_stats();
+                const double n = (double) generated.size();
+                std::printf("DECODE %s tokens=%zu tok_s=%.3f ms_tok=%.3f cpu_experts_tok=%.2f cpu_ms_tok=%.3f misses_tok=%.2f drafts=%llu accepted=%llu matches_serial=%d target_pick_differences=%zu\n",
+                            name, generated.size(), n * 1000 / wall, wall / n,
+                            (after.cpu_experts - before.cpu_experts) / n, (after.cpu_ms - before.cpu_ms) / n,
+                            (after.misses - before.misses) / n, (unsigned long long) (model.spec_steps_ - offers),
+                            (unsigned long long) (model.spec_hits_ - accepts), serial_tokens.empty() || generated == serial_tokens, model.follow_differ());
+                std::fflush(stdout);
+                return true;
+            };
+            if (!bench("no-mtp", false, 0, -1) || !bench("mtp-default", true, 0, -1) ||
+                !bench("mtp-cpu20", true, 20, -1) || !bench("mtp-cpu10", true, 10, -1) ||
+                !bench("mtp-pcie0", true, 0, 0.0) || !bench("mtp-pcie0.5", true, 0, 0.5) ||
+                !bench("mtp-default-repeat", true, 0, -1)) {
+                std::fprintf(stderr, "decode comparison: %s\n", err.c_str());
+                return 1;
+            }
+        }
+        return mismatches == 0 && draft_mismatches == 0 && worst < 1.0 ? 0 : 1;
     }
     // GLM_TEST_TIME=<n>: then n more tokens token by token, twice: the time a token costs (with and without a DFlash
     // drafter loaded, STRATA_GLM_DFLASH, the same forward)
