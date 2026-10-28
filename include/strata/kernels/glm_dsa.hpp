@@ -60,4 +60,11 @@ void glm_mla_attention(const float* q_abs, const float* latents, const int* cell
                        int kv_lora, int n_head, int v_head, int qk_nope, int T, int n_sel, float* out,
                        void* stream);
 
+/// The same with glm-dsa's (GLM-5.3) rope part: each score gains q_pe_h . k_pe_cell and the scale
+/// becomes 1/sqrt(qk_nope + n_rot).  q_pe holds head h of token t at q_pe + q_pe_stride*(h + n_head*t)
+/// (the roped tail of the q_b projection); k_pe is the cache, n_rot floats per cell.
+void glm_mla_attention_pe(const float* q_abs, const float* q_pe, int q_pe_stride, const float* latents,
+                          const float* k_pe, int n_rot, const int* cells, const float* wv_b, int kv_lora,
+                          int n_head, int v_head, int qk_nope, int T, int n_sel, float* out, void* stream);
+
 }  // namespace strata::kernels
