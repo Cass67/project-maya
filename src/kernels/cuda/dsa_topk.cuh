@@ -7,7 +7,7 @@
 //      top-th largest - and how many of the keys equal to it are taken;
 //   2. one pass in pool order (each thread a contiguous run, exclusive scans for the offsets) collects the winners:
 //      every key above the cut-off and the first `need` equal to it - the lower indices, as the rank loop chose;
-//   3. a bitonic sort of the <= 1024 winners, packed as (key << 32) | ~index, descending.
+//   3. a bitonic sort of the <= kMaxTop winners, packed as (key << 32) | ~index, descending.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -20,16 +20,18 @@ __device__ __forceinline__ unsigned score_key(float f) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
-// cells[r * kpool + m] = p * kpool + m for the top `top` pools p of sc[0, n_vis) in rank order; 1 <= top <= 1024,
+// cells[r * kpool + m] = p * kpool + m for the top `top` pools p of sc[0, n_vis) in rank order; 1 <= top <= kMaxTop,
 // top <= n_vis, blockDim.x == 1024.  Every thread of the block must call it.  (static: each kernel file that includes
 // this gets its own copy - an external symbol would be defined twice at link time)
+// glm-dsa takes the top 2048 positions (a token is its own pool); Flash's pools stay under 1024
+constexpr int kMaxTop = 2048;
 static __device__ void select_top_pools(const float* __restrict__ sc, int n_vis, int top, int kpool, int* __restrict__ cells) {
     constexpr int NT = 1024;
     __shared__ unsigned s_hist[256];
     __shared__ unsigned s_prefix, s_mask;
     __shared__ int s_need;
     __shared__ int s_gt[NT], s_eq[NT];
-    __shared__ unsigned long long s_win[NT];
+    __shared__ unsigned long long s_win[kMaxTop];
     const int tid = threadIdx.x;
     if (tid == 0) {
         s_prefix = 0u;
