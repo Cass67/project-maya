@@ -24,18 +24,8 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "tools"))
-from gguf_reader import GGUFFile                     # noqa: E402
+from gguf_reader import BLOCK_GEOMETRY as GEOM, GGUFFile   # noqa: E402
 from gguf_writer import dequantize_q2_0              # noqa: E402
-
-# gguf-py names differ from our reader's names in a few places; map only what differs.
-_GGUF_PY_NAME = {"Q4_0": "Q4_0", "Q8_0": "Q8_0", "Q4_K": "Q4_K", "Q5_K": "Q5_K", "Q6_K": "Q6_K",
-                 "Q3_K": "Q3_K", "IQ4_NL": "IQ4_NL", "IQ4_XS": "IQ4_XS", "Q5_0": "Q5_0"}
-
-# (elements per block, bytes per block) - mirrors block_geometry() in src/artifact/gguf_reader.cpp
-GEOM = {"F32": (1, 4), "F16": (1, 2), "BF16": (1, 2),
-        "Q4_0": (32, 18), "Q5_0": (32, 22), "Q8_0": (32, 34), "IQ4_NL": (32, 18),
-        "Q3_K": (256, 110), "Q4_K": (256, 144), "Q5_K": (256, 176), "Q6_K": (256, 210),
-        "IQ4_XS": (256, 136), "Q2_0": (64, 18)}
 
 
 def _dequant_flat(type_name: str, raw: np.ndarray) -> np.ndarray:
@@ -54,7 +44,7 @@ def _dequant_flat(type_name: str, raw: np.ndarray) -> np.ndarray:
     if type_name == "F16":
         return raw.view(np.float16).astype(np.float32)
     from gguf import quants, GGMLQuantizationType as Q
-    return quants.dequantize(raw, Q[_GGUF_PY_NAME[type_name]]).astype(np.float32)
+    return quants.dequantize(raw, Q[type_name]).astype(np.float32)
 
 
 def _bf16_to_f32(raw: np.ndarray) -> np.ndarray:
