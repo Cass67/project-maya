@@ -205,7 +205,8 @@ std::vector<std::vector<uint8_t>> synthetic_q2(int experts, int64_t out_rows, in
     return w;
 }
 
-bool run_real_iq3_first_expert(Context & ctx, hipStream_t stream, const std::string & pack) {
+bool run_real_first_expert(Context & ctx, hipStream_t stream, const std::string & pack,
+                           int64_t N, int64_t FF) {
     std::ifstream meta(pack + "/native_experts.txt");
     if (!meta) throw std::runtime_error("cannot open native_experts.txt: " + pack);
     int layer = -1, gt = -1, dt = -1;
@@ -215,13 +216,10 @@ bool run_real_iq3_first_expert(Context & ctx, hipStream_t stream, const std::str
     while (std::getline(meta, line)) {
         if (line.empty() || line[0] == '#') continue;
         std::istringstream ss(line);
-        if (ss >> layer >> gt >> dt >> offset >> blob_bytes && layer == 0) { found = true; break; }
+        if (ss >> layer >> gt >> dt >> offset >> blob_bytes) { found = true; break; }
     }
-    if (!found) throw std::runtime_error("native metadata has no layer 0");
-    if (gt != GGML_TYPE_IQ3_XXS || !supported(gt) || !supported(dt)) {
-        std::cout << "real-IQ3 first expert skipped: layer 0 types are " << gt << "/" << dt << '\n';
-        return false;
-    }
+    if (!found) throw std::runtime_error("native metadata has no expert layer");
+    if (!supported(gt) || !supported(dt)) throw std::runtime_error("unsupported native expert quantization");
     std::ifstream file(pack + "/experts.bin", std::ios::binary);
     if (!file) throw std::runtime_error("cannot open experts.bin: " + pack);
     std::vector<uint8_t> blob((size_t) blob_bytes);
@@ -229,7 +227,6 @@ bool run_real_iq3_first_expert(Context & ctx, hipStream_t stream, const std::str
     file.read((char *) blob.data(), (std::streamsize) blob.size());
     if (!file) throw std::runtime_error("short read of first native expert");
 
-    constexpr int64_t N = 2560, FF = 640;
     const size_t gu_row = row_bytes((ggml_type) gt, N), d_row = row_bytes((ggml_type) dt, FF);
     const size_t one_gu = (size_t) FF * gu_row, down_off = 2 * one_gu, one_down = (size_t) N * d_row;
     if (down_off + one_down != blob.size()) throw std::runtime_error("native blob shape/offset mismatch");
@@ -238,18 +235,22 @@ bool run_real_iq3_first_expert(Context & ctx, hipStream_t stream, const std::str
     const int rows = 5;
     const std::vector<int> counts{rows};
     const auto src = permutation(rows, 2, false), dst = permutation(rows, 1, true);
-    run_product(ctx, stream, "real-first-IQ3_XXS-GU", (ggml_type) gt, 1280, N, {gu}, counts,
+    run_product(ctx, stream, "real-first-GU", (ggml_type) gt, 2 * FF, N, {gu}, counts,
                 make_activations(rows, N, 71), src, dst);
     run_product(ctx, stream, "real-first-down", (ggml_type) dt, N, FF, {down}, counts,
                 make_activations(rows, FF, 73), src, dst);
-    std::cout << "real first expert tested: layer=0 expert=0 blob_bytes=" << blob_bytes << '\n';
+    std::cout << "real first expert tested: layer=" << layer << " expert=0 blob_bytes=" << blob_bytes << '\n';
     return true;
 }
 } // namespace
 
 int main(int argc, char ** argv) {
     try {
-        if (argc > 2) throw std::runtime_error("usage: mmq-parity-test [optional-native-pack-dir]");
+        if (argc != 1 && argc != 2 && argc != 4)
+            throw std::runtime_error("usage: mmq-parity-test [native-pack-dir [n_embd n_ff]]");
+        const int64_t n_embd = argc == 4 ? std::stoll(argv[2]) : 2560;
+        const int64_t n_ff = argc == 4 ? std::stoll(argv[3]) : 640;
+        if (n_embd <= 0 || n_ff <= 0) throw std::runtime_error("invalid expert dimensions");
         hip_check(hipSetDevice(0), "hipSetDevice");
         hipStream_t stream = nullptr;
         hip_check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
@@ -271,7 +272,7 @@ int main(int argc, char ** argv) {
                             make_activations(rows, 640, trial + 3), src, dst);
                 ++trial;
             }
-            if (argc == 2) run_real_iq3_first_expert(ctx, stream, argv[1]);
+            if (argc >= 2) run_real_first_expert(ctx, stream, argv[1], n_embd, n_ff);
         }
         hip_check(hipStreamSynchronize(stream), "final synchronize");
         hip_check(hipStreamDestroy(stream), "destroy stream");
