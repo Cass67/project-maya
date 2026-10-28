@@ -458,10 +458,15 @@ struct DsaRopePrepArgs {
     int idx_key = 128;
     int p = 0;
     float base = 8000000.0f, eps = 1e-5f, ln_eps = 0.0f;
+    // T rows (the prompt path): row t at position p + t, its inputs/outputs a row apart (kv_raw kv_lora + n_rot wide);
+    // qr_q may then be null, qr16 (optional) takes qr's FP16
+    int T = 1;
+    uint16_t* qr16 = nullptr;
 };
 void dsa_rope_prep(const DsaRopePrepArgs& a, cudaStream_t s);
-/// ggml rope NORM on the first n_rot floats of n_head heads (head h at x + stride * h), at position pos.
-void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base, cudaStream_t s);
+/// ggml rope NORM on the first n_rot floats of n_head heads (head h at x + stride * h), at position pos; T rows ld floats
+/// apart, row t at pos + t.
+void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base, cudaStream_t s, int T = 1, int ld = 0);
 /// glm-dsa's absorbed MLA for one token: q heads of [nope (qk_nope) | rope (n_rot)] k_mla apart; scores q_abs . latent +
 /// q_pe . k_pe over the cells (nullptr: every position 0 .. n_sel-1, the dense NextN block), / sqrt(qk_nope + n_rot);
 /// out_h = wv_b_h . ctx as q8_1.  scratch: n_head x (kv_lora + v_head).

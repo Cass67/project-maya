@@ -7022,7 +7022,15 @@ __device__ __forceinline__ void rope_pair(float x0, float x1, int i, int n_rot, 
 __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) {
     __shared__ float sred[32];
     __shared__ float sy[1024];
-    const int tid = threadIdx.x, lane = tid & 31;
+    const int tid = threadIdx.x, lane = tid & 31, t = blockIdx.y;
+    a.p += t;   // (a prompt row: its inputs and outputs a row further)
+    if (a.qr_raw != nullptr) {
+        a.qr_raw += (size_t) t * a.q_lora;
+        a.qr += (size_t) t * a.q_lora;
+        if (a.qr16 != nullptr) a.qr16 += (size_t) t * a.q_lora;
+    }
+    a.kv_raw += (size_t) t * (a.kv_lora + a.n_rot);
+    if (a.ik_raw != nullptr) a.ik_raw += (size_t) t * a.idx_key;
     if (blockIdx.x == 0) {   // qr = rms(qr_raw) * w, and its q8_1
         if (a.qr_raw == nullptr) return;   // a batched NextN cache fill needs only the latent/k_pe
         float ss = 0.0f;
@@ -7031,7 +7039,8 @@ __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) 
         for (int e = tid; e < a.q_lora; e += blockDim.x) {
             const float xv = a.qr_raw[e] * inv * a.q_a_norm[e];
             a.qr[e] = xv;
-            q8_1_store_warp(xv, (block_q8_1*) a.qr_q + e / 32, lane);
+            if (a.qr_q != nullptr) q8_1_store_warp(xv, (block_q8_1*) a.qr_q + e / 32, lane);
+            if (a.qr16 != nullptr) a.qr16[e] = __half_as_ushort(__float2half(xv));
         }
     } else if (blockIdx.x == 1) {   // the latent (normed, FP16 cache row p) and k_pe (roped, NOT normed, F32 row p)
         float ss = 0.0f;
@@ -7066,11 +7075,13 @@ __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) 
     }
 }
 
-__global__ void rope_heads_kernel(float* __restrict__ x, int n_rot, int stride, int n_head, int pos, float base) {
+__global__ void rope_heads_kernel(float* __restrict__ x, int n_rot, int stride, int n_head, int pos, float base,
+                                  int ld) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_head * (n_rot / 2)) return;
     const int h = idx / (n_rot / 2), i = idx % (n_rot / 2);
-    float* xh = x + (size_t) stride * h + 2 * i;
+    pos += blockIdx.y;
+    float* xh = x + (size_t) ld * blockIdx.y + (size_t) stride * h + 2 * i;
     float y0, y1;
     rope_pair(xh[0], xh[1], i, n_rot, pos, base, y0, y1);
     xh[0] = y0;
@@ -7145,13 +7156,13 @@ __global__ void __launch_bounds__(256) mla_pe_attend_kernel(const float* __restr
 }  // namespace
 
 void dsa_rope_prep(const DsaRopePrepArgs& a, cudaStream_t s) {
-    dsa_rope_prep_kernel<<<a.ik_raw != nullptr ? 3 : 2, 1024, 0, s>>>(a);
+    dsa_rope_prep_kernel<<<dim3(a.ik_raw != nullptr ? 3 : 2, (unsigned) a.T), 1024, 0, s>>>(a);
     launch_check("dsa_rope_prep");
 }
 
-void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base, cudaStream_t s) {
+void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base, cudaStream_t s, int T, int ld) {
     const int n = n_head * (n_rot / 2);
-    rope_heads_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, n_rot, stride, n_head, pos, base);
+    rope_heads_kernel<<<dim3((n + 255) / 256, (unsigned) T), 256, 0, s>>>(x, n_rot, stride, n_head, pos, base, ld);
     launch_check("rope_heads");
 }
 

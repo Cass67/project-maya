@@ -234,16 +234,16 @@ DsaBufs carve_dsa(Carve& c, size_t T, const Glm5Geometry& g, int max_pools) {
     b.qr_raw = c.take<float>(T * g.q_lora);
     b.qr = c.take<float>(T * g.q_lora);
     b.qr16 = c.take<uint16_t>(T * g.q_lora);
-    b.kv_raw = c.take<float>(T * g.kv_lora);
+    b.kv_raw = c.take<float>(T * (g.kv_lora + (g.dsa ? g.n_rot : 0)));   // (glm-dsa: + k_pe)
     b.ik_raw = c.take<float>(T * g.idx_key);
     b.ig_raw = c.take<float>(T * g.idx_key);
     b.iw = c.take<float>(T * g.idx_heads);
-    b.q = c.take<float>(T * (size_t) g.n_head * g.qk_nope);
+    b.q = c.take<float>(T * (size_t) g.n_head * (g.dsa ? g.k_mla() : g.qk_nope));
     b.iq = c.take<float>(T * (size_t) g.idx_heads * g.idx_key);
     b.cells = c.take<int>(T * (size_t) g.n_sel_max());
     b.n_sel = c.take<int>(T);
     b.score_ld = std::max(1, max_pools);
-    b.score = c.take<float>(T * (size_t) b.score_ld);
+    b.score = g.dsa ? nullptr : c.take<float>(T * (size_t) b.score_ld);   // (glm-dsa scores a row at a time)
     b.q_abs = c.take<float>(T * (size_t) g.n_head * g.kv_lora);
     b.ctx = c.take<float>(T * (size_t) g.n_head * g.kv_lora);
     b.attn = c.take<float>(T * (size_t) g.n_head * g.v_head);
@@ -549,6 +549,12 @@ void x3_run_set(const X3Lane& L, const uint8_t* wbase, int n_exp, size_t stride,
 }
 
 // y[i] += a[i] (the waiting part's weighted sum into the working part's ffn rows)
+// glm-dsa: row t's selection size, min(top-k, its visible positions)
+__global__ void dsa_nsel_kernel(int* __restrict__ n_sel, int p0, int T, int top_k) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t < T) n_sel[t] = min(top_k, p0 + t + 1);
+}
+
 __global__ void add_f32_kernel(float* __restrict__ y, const float* __restrict__ a, int64_t n) {
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         y[i] += a[i];
@@ -1485,7 +1491,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     size_t uni = 0;
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
-    if (has_dsa && !g.dsa) { Carve d; carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
+    if (has_dsa) { Carve d; carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
     if (has_moe) { Carve m; carve_moe(m, T, (size_t) shexp_sub(sub_env), g); uni = std::max(uni, m.off); }
     // the NextN block's cache fill (the last half) carves 4 n_embd + 1.5 n_embd rows of its own
@@ -2476,6 +2482,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (!kv_prefetch(kv_dsa_from(l0_))) return false;   // (the layers before the first DSA layer run meanwhile)
     prestage(next_moe(l0_));   // (the dense layers before the first MoE one run meanwhile)
     for (auto& t : S->tr) t.on = false;
+    bool dsa_sel = false;   // (glm-dsa: this chunk's rows hold a full indexer layer's selection)
     for (int il = l0_; il < l1_; ++il) {
         progress_at("the prompt: layer", il);   // a layer is the serve watchdog's heartbeat (issue #40)
         progress_beat();
@@ -2508,25 +2515,106 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         uint16_t* const lat = kv_host != nullptr ? (uint16_t*) S->kv_stage : (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
 
         // ---- the mixer, in sub-batches of S->sub tokens (the recurrences carry their state across)
-        if (g.dsa) {
-            // Keep the already-validated roped MLA/indexer arithmetic while batching
-            // the dense/shared/routed FFNs below. Each row owns its selection across
-            // full/shared layers; a single F->cells would reuse the last row's top-k.
-            struct Restore {
-                FastState* f;
-                float *x, *mixer;
-                int* cells;
-                int n_sel;
-                ~Restore() { f->x = x; f->mixer = mixer; f->cells = cells; f->dsa_n_sel = n_sel; }
-            } restore{F, F->x, F->mixer, F->cells, F->dsa_n_sel};
-            for (int t = 0; t < T; ++t) {
-                F->x = S->x + (size_t) t * E;
-                F->mixer = S->mixer + (size_t) t * E;
-                F->cells = S->dsa_cells + (size_t) t * g.idx_top_k;
-                F->dsa_n_sel = std::min<int64_t>(g.idx_top_k, p0 + t + 1);
-                gf::quantize_q8_1(F->x, F->xq, E, s);
-                if (!fast_dsa_rope(il, p0 + t, err)) return false;
+        if (g.dsa) for (int t0 = 0; t0 < T; t0 += S->sub) {
+            // glm-dsa: fast_dsa_rope's arithmetic over sub-batches of rows - the projections as GEMMs, the absorbed
+            // products as strided-batched FP32 GEMMs, the attention on wmma2 with the k_pe term.  A row keeps its
+            // selection in S->dsa_cells from its part's last full indexer layer (split bounds land on full layers).
+            const int tn = std::min(S->sub, T - t0);
+            const float* xs = S->x + (size_t) t0 * E;
+            const uint16_t* x16 = S->x16 + (size_t) t0 * E;
+            float* mixer = S->mixer + (size_t) t0 * E;
+            const int pt = (int) (p0 + t0), KS = g.idx_top_k, HQ = g.n_head * g.k_mla();
+            const bool full = g.indexer_full[(size_t) il] != 0;
+            if (!full && !dsa_sel) {
+                err = "glm prefill: glm-dsa layer " + std::to_string(il) + " shares an indexer selection this part never made";
+                return false;
             }
+            Carve c{S->uni};
+            DsaBufs B = carve_dsa(c, (size_t) tn, g, S->max_pools);
+            int* const cells = S->dsa_cells + (size_t) t0 * KS;
+            hgemm_q(Ly.q_a, g.q_lora, E, x16, E, B.qr_raw, g.q_lora, tn, 0.0f);
+            hgemm_q(Ly.kv_a, g.kv_lora + g.n_rot, E, x16, E, B.kv_raw, g.kv_lora + g.n_rot, tn, 0.0f);
+            if (full) {
+                sgemm_bf16(Ly.idx_k, g.idx_key, E, xs, E, B.ik_raw, g.idx_key, tn, 1.0f);
+                sgemm_bf16(Ly.idx_proj, g.idx_heads, E, xs, E, B.iw, g.idx_heads, tn,
+                           1.0f / std::sqrt((float) (g.idx_key * g.idx_heads)));
+            }
+            float* const kpe = state_ + dsa_kpe_[(size_t) il];
+            float* const ik = state_ + dsa_pool_[(size_t) il];
+            gf::DsaRopePrepArgs d;
+            d.qr_raw = B.qr_raw;
+            d.q_a_norm = Ly.q_a_norm;
+            d.qr = B.qr;
+            d.qr16 = B.qr16;
+            d.q_lora = g.q_lora;
+            d.kv_raw = B.kv_raw;
+            d.kv_norm = Ly.kv_a_norm;
+            d.lat = lat;
+            d.kpe = kpe;
+            d.kv_lora = g.kv_lora;
+            d.n_rot = g.n_rot;
+            d.ik_raw = full ? B.ik_raw : nullptr;
+            d.k_norm_w = Ly.k_norm_w;
+            d.k_norm_b = Ly.k_norm_b;
+            d.ik = ik;
+            d.idx_key = g.idx_key;
+            d.p = pt;
+            d.T = tn;
+            d.base = g.rope_base;
+            d.eps = g.norm_eps;
+            d.ln_eps = g.idx_ln_eps;
+            gf::dsa_rope_prep(d, s);
+            hgemm_q(Ly.q_b, HQ, g.q_lora, B.qr16, g.q_lora, B.q, HQ, tn, 0.0f);
+            gf::rope_heads(B.q + g.qk_nope, g.n_rot, g.k_mla(), g.n_head, pt, g.rope_base, s, tn, HQ);
+            S->mark("dsa_proj", s);
+            if (full) {
+                // a row whose every position fits the top-k takes them all (dsa_select_all, as the token path)
+                const bool all_on = gf::dsa_select_all_on();
+                if (!all_on || pt + tn > KS) {
+                    sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq,
+                               g.idx_heads * g.idx_key, tn, 1.0f);
+                    gf::rope_heads(B.iq, g.n_rot, g.idx_key, g.idx_heads, pt, g.rope_base, s, tn, g.idx_heads * g.idx_key);
+                }
+                for (int t = 0; t < tn; ++t) {
+                    const int p = pt + t, n_vis = p + 1, n_sel = std::min(KS, n_vis);
+                    if (all_on && n_vis <= KS) {
+                        gf::dsa_select_all(n_vis, 1, n_sel, p, cells + (size_t) t * KS, s);
+                    } else {
+                        gf::dsa_score(B.iq + (size_t) t * g.idx_heads * g.idx_key, ik, B.iw + (size_t) t * g.idx_heads,
+                                      g.idx_key, g.idx_heads, n_vis, F->score, s);
+                        gf::dsa_select(F->score, n_vis, 1, n_sel, n_sel, p, cells + (size_t) t * KS, s);
+                    }
+                }
+                dsa_sel = true;
+                S->mark("dsa_index", s);
+            }
+            dsa_nsel_kernel<<<(tn + 255) / 256, 256, 0, s>>>(B.n_sel, pt, tn, KS);
+            // q_abs[t][h] = wk_b[h] (kv_lora x qk_nope) . q_nope[t][h]
+            gb::bf16_to_f32(Ly.k_b, S->w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, s);
+            blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one, S->w32,
+                                              g.qk_nope, (long long) g.kv_lora * g.qk_nope, B.q, HQ, g.k_mla(), &zero,
+                                              B.q_abs, g.n_head * g.kv_lora, g.kv_lora, g.n_head),
+                    "dsa q_abs");
+            S->mark("dsa_qabs", s);
+#if defined(STRATA_USE_HIP)
+            gb::mla_attn_wmma2(B.q_abs, lat, cells, B.n_sel, KS, g.n_head, g.kv_lora,
+                               1.0f / std::sqrt((float) (g.qk_nope + g.n_rot)), tn, B.ctx, s, false, B.q + g.qk_nope,
+                               g.k_mla(), kpe, g.n_rot);
+#else
+            err = "glm prefill: the glm-dsa prompt attention is HIP only";
+            return false;
+#endif
+            S->mark("dsa_attn", s);
+            // out[t][h] = wv_b[h] (v_head x kv_lora) . ctx[t][h]
+            gb::bf16_to_f32(Ly.v_b, S->w32, (int64_t) g.n_head * g.v_head * g.kv_lora, s);
+            blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.v_head, tn, g.kv_lora, &one, S->w32,
+                                              g.kv_lora, (long long) g.v_head * g.kv_lora, B.ctx, g.n_head * g.kv_lora,
+                                              g.kv_lora, &zero, B.attn, g.n_head * g.v_head, g.v_head, g.n_head),
+                    "dsa mla out");
+            gb::f32_to_f16(B.attn, B.attn16, (int64_t) tn * g.n_head * g.v_head, s);
+            if (!skip_output)
+                hgemm_q(Ly.out, E, g.n_head * g.v_head, B.attn16, g.n_head * g.v_head, mixer, E, tn, 0.0f);
+            if (glmfast::prefill_submit()) glmfast::submit_queued(s);
         } else for (int t0 = 0; t0 < T; t0 += S->sub) {
             const int tn = std::min(S->sub, T - t0);
             const float* xs = S->x + (size_t) t0 * E;

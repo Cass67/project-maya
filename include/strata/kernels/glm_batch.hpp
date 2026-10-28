@@ -101,8 +101,11 @@ void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, c
 /// The same attention with Q in F32 on wave32 WMMA intrinsics (gfx11/gfx12): the FP32 query and softmax probability
 /// are each split into FP16 high + residual, both products through WMMA with F32 accumulation and online softmax.
 /// n_head % 16 == 0, kv_lora 512. lat_q8 expands INT8 codes with one FP16 scale per 32 values as they are loaded.
+/// q_pe non-null (glm-dsa): each score also adds q_pe[t][h] . kpe[cell] (n_rot F32 values; head h at q_pe + q_pe_hs * h,
+/// token t n_head * q_pe_hs further) before the scale.
 void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
-                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false);
+                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false,
+                    const float* q_pe = nullptr, int q_pe_hs = 0, const float* kpe = nullptr, int n_rot = 0);
 /// True on the current device where mla_attn_wmma2 runs (gfx11/gfx12); mla_wmma2_default() is true on gfx12 (RDNA4) and gfx1151 (Strix Halo),
 /// where the prompt path prefers it over mla_attn_f16q.
 bool mla_wmma2_supported();
