@@ -109,14 +109,15 @@ __global__ void glm_dsa_select_kernel(const float* __restrict__ score, int n_poo
 __global__ void glm_mla_attention_kernel(const float* __restrict__ q_abs, const float* __restrict__ latents,
                                          const int* __restrict__ cells, const float* __restrict__ wv_b,
                                          int kv_lora, int n_head, int v_head, int qk_nope, int n_sel,
-                                         float* __restrict__ out) {
+                                         float* __restrict__ out, const float* __restrict__ q_pe,
+                                         int q_pe_stride, const float* __restrict__ k_pe, int n_rot) {
     const int block = blockIdx.x;
     const int h = block % n_head;
     const int t = block / n_head;
     const int tid = threadIdx.x;
     const int nt = blockDim.x;
     const int* row = cells + (size_t) n_sel * t;
-    const float scale = rsqrtf((float) qk_nope);
+    const float scale = rsqrtf((float) (qk_nope + n_rot));
 
     extern __shared__ float smem[];   // probs (n_sel) then ctx (kv_lora)
     float* s_prob = smem;
@@ -133,6 +134,11 @@ __global__ void glm_mla_attention_kernel(const float* __restrict__ q_abs, const 
         const float* qa = q_abs + (size_t) kv_lora * h + (size_t) kv_lora * n_head * t;
         float dot = 0.0f;
         for (int e = 0; e < kv_lora; ++e) dot += qa[e] * lat[e];
+        if (q_pe != nullptr) {   // glm-dsa: the roped part, q_pe_h . k_pe_cell
+            const float* qp = q_pe + (size_t) q_pe_stride * (h + (size_t) n_head * t);
+            const float* kp = k_pe + (size_t) n_rot * cell;
+            for (int e = 0; e < n_rot; ++e) dot += qp[e] * kp[e];
+        }
         s_prob[s] = dot * scale;
     }
     __syncthreads();
@@ -209,7 +215,16 @@ void glm_mla_attention(const float* q_abs, const float* latents, const int* cell
     if (kv_lora <= 0 || n_head <= 0 || v_head <= 0 || T <= 0 || n_sel <= 0) return;
     const size_t smem = ((size_t) n_sel + kv_lora) * sizeof(float);
     glm_mla_attention_kernel<<<T * n_head, DS_THREADS, smem, (cudaStream_t) stream>>>(
-        q_abs, latents, cells, wv_b, kv_lora, n_head, v_head, qk_nope, n_sel, out);
+        q_abs, latents, cells, wv_b, kv_lora, n_head, v_head, qk_nope, n_sel, out, nullptr, 0, nullptr, 0);
+}
+
+void glm_mla_attention_pe(const float* q_abs, const float* q_pe, int q_pe_stride, const float* latents,
+                          const float* k_pe, int n_rot, const int* cells, const float* wv_b, int kv_lora,
+                          int n_head, int v_head, int qk_nope, int T, int n_sel, float* out, void* stream) {
+    if (kv_lora <= 0 || n_head <= 0 || v_head <= 0 || T <= 0 || n_sel <= 0) return;
+    const size_t smem = ((size_t) n_sel + kv_lora) * sizeof(float);
+    glm_mla_attention_kernel<<<T * n_head, DS_THREADS, smem, (cudaStream_t) stream>>>(
+        q_abs, latents, cells, wv_b, kv_lora, n_head, v_head, qk_nope, n_sel, out, q_pe, q_pe_stride, k_pe, n_rot);
 }
 
 }  // namespace strata::kernels

@@ -83,7 +83,16 @@ struct Glm5Geometry {
     float w_scale = 1.0f;
     int norm_w = 1;
     float swiglu_exp = 10.0f, swiglu_shexp = 10.0f;
+    // glm-dsa (GLM-5.3, ref/glm_dsa.py): roped MLA (q_pe/k_pe of n_rot dims beside the nope part), a
+    // token indexer (kpool 1, no tail) roped on its first n_rot dims, shared indexer layers reusing the
+    // last full layer's selection, a plain residual (hc 1), no SwiGLU clamps.  idx_ln_eps: the indexer
+    // key's LayerNorm eps (glm5-next uses norm_eps; llama.cpp runs glm-dsa's with 0)
+    bool dsa = false;
+    int n_rot = 0;
+    float rope_base = 10000.0f;
+    float idx_ln_eps = 1e-5f;
 
+    int k_mla() const { return qk_nope + n_rot; }      // a q_b head's width: [nope | rope]
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
@@ -323,6 +332,7 @@ private:
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
+    std::vector<int64_t> dsa_kpe_;                // glm-dsa: the roped k_pe cache (n_rot per cell)
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the

@@ -1,0 +1,2 @@
+attn_norm-0 24 128
+result_output 24 512

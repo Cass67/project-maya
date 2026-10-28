@@ -814,6 +814,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(glm_model_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
   add_test(NAME glm_model_test COMMAND glm_model_test --selftest)
   set_tests_properties(glm_model_test PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  add_executable(glm_dsa_model_test src/core/glm_dsa_model_test.cpp)
+  target_include_directories(glm_dsa_model_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_dsa_model_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
+  add_test(NAME glm_dsa_model_test COMMAND glm_dsa_model_test --selftest)
+  set_tests_properties(glm_dsa_model_test PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
   # the 45-layer big fixture: its 1.2 GB GGUF is generated into the build tree by a ctest
   # fixture (far too large to commit); the f64 expectation IS committed (data/glm5-big-dumps)

@@ -426,18 +426,38 @@ __global__ void mean_streams_kernel(const float* __restrict__ R, float* __restri
     y[e + (size_t) n_embd * t] = acc / (float) hc;
 }
 
+// q_stride: a head's width in q (qk_nope for glm5-next; qk_nope + n_rot for glm-dsa, whose heads are
+// [nope | rope] and absorb only the nope part)
 __global__ void q_absorb_kernel(const float* __restrict__ wk_b, const float* __restrict__ q,
-                                float* __restrict__ y, int qk_nope, int kv_lora, int n_head, int T) {
+                                float* __restrict__ y, int qk_nope, int kv_lora, int n_head, int T, int q_stride) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= kv_lora * n_head * T) return;
     const int t = idx / (kv_lora * n_head);
     const int h = (idx / kv_lora) % n_head;
     const int c = idx % kv_lora;
     const float* w = wk_b + (size_t) qk_nope * kv_lora * h;           // (e, c) at e + qk_nope*c
-    const float* qh = q + (size_t) qk_nope * h + (size_t) qk_nope * n_head * t;
+    const float* qh = q + (size_t) q_stride * h + (size_t) q_stride * n_head * t;
     float acc = 0.0f;
     for (int e = 0; e < qk_nope; ++e) acc += w[(size_t) e + (size_t) qk_nope * c] * qh[e];
     y[c + (size_t) kv_lora * h + (size_t) kv_lora * n_head * t] = acc;
+}
+
+// ggml_rope_ext, LLAMA_ROPE_TYPE_NORM, no YaRN: the adjacent pairs (2i, 2i+1) of the first n_rot floats of
+// each of n_head heads (head h at x + stride*h) rotate by pos * base^(-2i/n_rot), theta stepped in f32 like
+// ggml's rope cache (theta *= base^(-2/n_rot)) so long positions round the same way.  One thread per pair.
+__global__ void rope_norm_kernel(float* __restrict__ x, int n_rot, int stride, int n_head, int pos, float base) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_head * (n_rot / 2)) return;
+    const int h = idx / (n_rot / 2);
+    const int i = idx % (n_rot / 2);
+    const float theta_scale = powf(base, -2.0f / (float) n_rot);
+    float theta = (float) pos;
+    for (int k = 0; k < i; ++k) theta *= theta_scale;
+    float* xh = x + (size_t) stride * h + 2 * i;
+    const float c = cosf(theta), sn = sinf(theta);
+    const float x0 = xh[0], x1 = xh[1];
+    xh[0] = x0 * c - x1 * sn;
+    xh[1] = x0 * sn + x1 * c;
 }
 
 int blocks(int n) { return (n + GM_THREADS - 1) / GM_THREADS; }
@@ -504,10 +524,62 @@ static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src,
 
 // ================================ geometry ================================
 
+// glm-dsa (GLM-5.3): what differs from glm5-next, read after the shared keys (mirrors
+// ref/glm_dsa.py::GlmDsaConfig key for key)
+static bool dsa_from_gguf(const strata::GgufFile& g, const std::string& p, Glm5Geometry& out, std::string& err) {
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        return v != nullptr && v->is_num() ? v->num() : def;
+    };
+    out.n_rot = (int) num("rope.dimension_count", 64);
+    out.rope_base = (float) num("rope.freq_base", 8000000.0);
+    out.qk_nope = out.qk_nope - out.n_rot;   // key_length_mla is the whole head: [nope | rope]
+    out.idx_ln_eps = (float) num("attention.layer_norm_epsilon", 0.0);
+    out.idx_kpool = 1;                        // the indexer scores tokens
+    out.idx_select_tail = 0;
+    out.hc = 1;                               // a plain residual
+    out.swiglu_exp = out.swiglu_shexp = INFINITY;
+    out.n_head_kv.assign((size_t) out.n_layers, 1);   // every layer is MLA + DSA
+
+    // the indexer types: the GGUF's array, else llama.cpp's fallback (glm-dsa.cpp): GLM 5 / 5.1 (context
+    // below 1M) index every layer, 5.2+ layers 0, 1 and every 4th from 2
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    const auto* types = g.get(p + "attention.indexer.types");
+    if (types != nullptr && types->type == strata::MetaType::ARRAY && types->items.size() >= (size_t) out.n_layers) {
+        for (int i = 0; i < out.n_layers; ++i) out.indexer_full[(size_t) i] = (int) types->items[(size_t) i].u;
+    } else if (num("context_length", 1048576) >= 1048576) {
+        for (int i = 2; i < out.n_layers; ++i) out.indexer_full[(size_t) i] = (i - 2) % 4 == 0;
+    }
+    if (!out.indexer_full[0]) {
+        err = "glm5_model: glm-dsa layer 0 must run a full indexer (a shared one has nothing to reuse)";
+        return false;
+    }
+    if (const auto* v = g.get(p + "rope.scaling.factor"); v != nullptr && v->is_num() && v->num() != 1.0) {
+        err = "glm5_model: glm-dsa rope scaling (YaRN) is not implemented; GLM-5.3 ships without it";
+        return false;
+    }
+    if (const auto* v = g.get(p + "attention.key_length"); v != nullptr && v->is_num() &&
+                                                            v->num() != (double) (out.kv_lora + out.n_rot)) {
+        err = "glm5_model: glm-dsa attention.key_length " + std::to_string(v->num()) + " != kv_lora + n_rot";
+        return false;
+    }
+    if (out.n_rot <= 0 || out.n_rot % 2 || out.n_rot > out.idx_key || out.qk_nope <= 0) {
+        err = "glm5_model: glm-dsa rope dims " + std::to_string(out.n_rot) + " do not fit the heads";
+        return false;
+    }
+    if ((int) num("expert_gating_func", 2) != 2) {
+        err = "glm5_model: glm-dsa routes with sigmoid gating (expert_gating_func 2)";
+        return false;
+    }
+    return true;
+}
+
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
-    // the KV PREFIX follows the file's own arch string, so it is detected once here
-    const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
+    // the KV PREFIX follows the file's own arch string, so it is detected once here; "glm-dsa" is
+    // GLM-5.3 itself (the 744B), which shares the MLA/DSA/MoE machinery
+    out.dsa = g.get("glm-dsa.block_count") != nullptr;
+    const std::string p = out.dsa ? "glm-dsa." : g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
     const auto num = [&](const std::string& key, double def, bool& ok) -> double {
         const auto* v = g.get(p + key);
         if (!v) return def;
@@ -566,6 +638,8 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     out.swiglu_exp = (float) num("swiglu_clamp_exp", out.swiglu_exp, ok);
     out.swiglu_shexp = (float) num("swiglu_clamp_shexp", out.swiglu_shexp, ok);
     if (const auto* v = g.get(p + "vocab_size")) out.n_vocab = (int) v->u;
+
+    if (out.dsa) return dsa_from_gguf(g, p, out, err);
 
     // the layer-type array: 0 marks a KDA (recurrent) layer
     out.n_head_kv.assign((size_t) out.n_layers, 0);
@@ -756,6 +830,7 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
     dsa_ik_.assign(g_.n_layers, 0);
     dsa_ig_.assign(g_.n_layers, 0);
     dsa_pool_.assign(g_.n_layers, 0);
+    dsa_kpe_.assign(g_.n_layers, 0);
     ik_ring_ = (int) max_ctx;   // the reference path keeps every position's indexer key / gate
     for (int il = 0; il < g_.n_layers; ++il) {
         if (il < l0_ || il >= l1_) continue;   // the other half's caches stay on the other device
@@ -764,6 +839,14 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;
             kda_conv_[(size_t) il] = floats;
             floats += (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
+        } else if (g_.dsa) {
+            // glm-dsa: the latent, its k_pe, and the roped indexer key of every token (a pool IS a token)
+            dsa_lat_[(size_t) il] = floats;
+            floats += (int64_t) g_.kv_lora * max_ctx;
+            dsa_kpe_[(size_t) il] = floats;
+            floats += (int64_t) g_.n_rot * max_ctx;
+            dsa_pool_[(size_t) il] = floats;
+            floats += (int64_t) g_.idx_key * max_ctx;
         } else {
             dsa_lat_[(size_t) il] = floats;
             floats += (int64_t) g_.kv_lora * max_ctx;
@@ -805,8 +888,8 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
     sc_g2 = take(g_.d_inner());
     sc_gated = take(g_.d_inner());
     sc_qr = take(g_.q_lora);
-    sc_kv = take(g_.kv_lora);
-    sc_q = take((int64_t) g_.n_head * g_.qk_nope);
+    sc_kv = take(g_.kv_lora + g_.n_rot);
+    sc_q = take((int64_t) g_.n_head * g_.k_mla());
     sc_qabs = take((int64_t) g_.kv_lora * g_.n_head);
     sc_iq = take((int64_t) g_.idx_heads * g_.idx_key);
     sc_iw = take(g_.idx_heads);
@@ -2220,6 +2303,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
     strata::kernels::GlmHcWorkspace hcws;
     strata::kernels::glm_hc_workspace_init(hcs, A + sc_inv, hcws);
     const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
+    int dsa_n_sel = 0;   // glm-dsa: the last full indexer layer's selection width (its cells stay in sc_cells)
 
     for (int il = l0_; il < l1_; ++il) {
         if (timing_ && !tev_rec(tev_a_, "a")) timing_ = false;
@@ -2227,19 +2311,84 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
         const auto W = [&](const char* suffix) { return w_.at("blk." + L + "." + suffix); };
         const auto ws_ = [&](const std::string& suffix) -> WSlot& { return ws_map_.at("blk." + L + "." + suffix); };
 
-        // ---- hc read + norm
-        strata::kernels::glm_hc_pre(R, W("hc_attn_fn.weight"), W("hc_attn_scale.weight"),
-                                    W("hc_attn_base.weight"), g.norm_eps, g.hc_eps, hcs, hcws, A + sc_mixed,
-                                    A + sc_pre, A + sc_post, A + sc_comb, nullptr);
-        cb_dump("hc_pre-" + L, A + sc_pre, g.hc);
-        cb_dump("hc_comb-" + L, A + sc_comb, g.hc * g.hc);
-        cb_dump("hc_post-" + L, A + sc_post, g.hc);
-        cb_dump("hc_attn_pre-" + L, A + sc_mixed, g.n_embd);
-        rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_mixed, W("attn_norm.weight"), A + sc_x, g.n_embd, 1,
-                                           g.norm_eps);
+        // ---- hc read + norm (glm-dsa: the plain residual, normed)
+        if (g.dsa) {
+            rms_norm_kernel<<<1, GM_THREADS>>>(R, W("attn_norm.weight"), A + sc_x, g.n_embd, 1, g.norm_eps);
+        } else {
+            strata::kernels::glm_hc_pre(R, W("hc_attn_fn.weight"), W("hc_attn_scale.weight"),
+                                        W("hc_attn_base.weight"), g.norm_eps, g.hc_eps, hcs, hcws, A + sc_mixed,
+                                        A + sc_pre, A + sc_post, A + sc_comb, nullptr);
+            cb_dump("hc_pre-" + L, A + sc_pre, g.hc);
+            cb_dump("hc_comb-" + L, A + sc_comb, g.hc * g.hc);
+            cb_dump("hc_post-" + L, A + sc_post, g.hc);
+            cb_dump("hc_attn_pre-" + L, A + sc_mixed, g.n_embd);
+            rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_mixed, W("attn_norm.weight"), A + sc_x, g.n_embd, 1,
+                                               g.norm_eps);
+        }
         cb_dump("attn_norm-" + L, A + sc_x, g.n_embd);
 
-        if (g.is_recr(il)) {
+        if (g.dsa) {
+            // ---- the glm-dsa mixer (ref/glm_dsa.py GlmDsa.attention): roped MLA over the indexer's selection
+            const int pos = (int) p;
+            GM_CHECK(gm_gemv(ws_("attn_q_a.weight"), A + sc_x, nullptr, 1.0f, A + sc_qr, g.q_lora, g.n_embd), err);
+            rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_qr, W("attn_q_a_norm.weight"), A + sc_qr, g.q_lora, 1,
+                                               g.norm_eps);
+            // kv_a_mqa -> [latent | k_pe]: the latent normed, k_pe roped (NOT normed)
+            GM_CHECK(gm_gemv(ws_("attn_kv_a_mqa.weight"), A + sc_x, nullptr, 1.0f, A + sc_kv, g.kv_lora + g.n_rot,
+                             g.n_embd), err);
+            rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_kv, W("attn_kv_a_norm.weight"), A + sc_kv, g.kv_lora, 1,
+                                               g.norm_eps);
+            rope_norm_kernel<<<blocks(g.n_rot / 2), GM_THREADS>>>(A + sc_kv + g.kv_lora, g.n_rot, g.n_rot, 1, pos,
+                                                                  g.rope_base);
+            float* lat = S + dsa_lat_[(size_t) il];
+            float* kpe = S + dsa_kpe_[(size_t) il];
+            GM_CHECK(cudaMemcpy(lat + (int64_t) g.kv_lora * p, A + sc_kv, (size_t) g.kv_lora * sizeof(float),
+                                cudaMemcpyDeviceToDevice), err);
+            GM_CHECK(cudaMemcpy(kpe + (int64_t) g.n_rot * p, A + sc_kv + g.kv_lora, (size_t) g.n_rot * sizeof(float),
+                                cudaMemcpyDeviceToDevice), err);
+            // q_b -> heads of [nope | rope]: the rope part roped in place, the nope part absorbed through wk_b
+            GM_CHECK(gm_gemv(ws_("attn_q_b.weight"), A + sc_qr, nullptr, 1.0f, A + sc_q, g.n_head * g.k_mla(),
+                             g.q_lora), err);
+            rope_norm_kernel<<<blocks(g.n_head * g.n_rot / 2), GM_THREADS>>>(A + sc_q + g.qk_nope, g.n_rot, g.k_mla(),
+                                                                             g.n_head, pos, g.rope_base);
+            q_absorb_kernel<<<blocks((int64_t) g.kv_lora * g.n_head), GM_THREADS>>>(
+                W("attn_k_b.weight"), A + sc_q, A + sc_qabs, g.qk_nope, g.kv_lora, g.n_head, 1, g.k_mla());
+
+            if (g.indexer_full[(size_t) il]) {
+                // the token indexer: the roped key IS the pool (kpool 1); score every visible token, keep top_k.
+                // (The Hadamard llama.cpp applies to q and k is orthonormal: no score changes, so it is skipped.)
+                GM_CHECK(gm_gemv(ws_("indexer.attn_k.weight"), A + sc_x, nullptr, 1.0f, A + sc_tmp, g.idx_key,
+                                 g.n_embd), err);
+                layer_norm_kernel<<<1, GM_THREADS>>>(A + sc_tmp, W("indexer.k_norm.weight"), W("indexer.k_norm.bias"),
+                                                     A + sc_tmp, g.idx_key, 1, g.idx_ln_eps);
+                rope_norm_kernel<<<blocks(g.n_rot / 2), GM_THREADS>>>(A + sc_tmp, g.n_rot, g.idx_key, 1, pos,
+                                                                      g.rope_base);
+                float* ikc = S + dsa_pool_[(size_t) il];
+                GM_CHECK(cudaMemcpy(ikc + (int64_t) g.idx_key * p, A + sc_tmp, (size_t) g.idx_key * sizeof(float),
+                                    cudaMemcpyDeviceToDevice), err);
+                GM_CHECK(gm_gemv(ws_("indexer.attn_q_b.weight"), A + sc_qr, nullptr, 1.0f, A + sc_iq,
+                                 g.idx_heads * g.idx_key, g.q_lora), err);
+                rope_norm_kernel<<<blocks(g.idx_heads * g.n_rot / 2), GM_THREADS>>>(A + sc_iq, g.n_rot, g.idx_key,
+                                                                                    g.idx_heads, pos, g.rope_base);
+                GM_CHECK(gm_gemv(ws_("indexer.proj.weight"), A + sc_x, nullptr, prescale, A + sc_iw, g.idx_heads,
+                                 g.n_embd), err);
+                strata::kernels::glm_dsa_score(A + sc_iq, ikc, A + sc_iw, g.idx_key, g.idx_heads, 1, pos + 1,
+                                               A + sc_score, nullptr);
+                dsa_n_sel = std::min(g.idx_top_k, pos + 1);
+                GM_CHECK(cudaMemcpy(d_pos_, &pos, sizeof(int), cudaMemcpyHostToDevice), err);
+                strata::kernels::glm_dsa_select(A + sc_score, pos + 1, 1, dsa_n_sel, 0, 1, dsa_n_sel, d_pos_,
+                                                (int*) (A + sc_cells), nullptr);
+            } else if (dsa_n_sel == 0) {
+                err = "glm5_model: glm-dsa layer " + L + " shares an indexer selection this part never made";
+                return false;
+            }
+            strata::kernels::glm_mla_attention_pe(A + sc_qabs, A + sc_q + g.qk_nope, g.k_mla(), lat, kpe, g.n_rot,
+                                                  (const int*) (A + sc_cells), W("attn_v_b.weight"), g.kv_lora,
+                                                  g.n_head, g.v_head, g.qk_nope, 1, dsa_n_sel, A + sc_attn, nullptr);
+            cb_dump("kqv_out-" + L, A + sc_attn, (int64_t) g.v_head * g.n_head);
+            GM_CHECK(gm_gemv(ws_("attn_output.weight"), A + sc_attn, nullptr, 1.0f, A + sc_mixer, g.n_embd,
+                             (int64_t) g.n_head * g.v_head), err);
+        } else if (g.is_recr(il)) {
             // ---- the KDA mixer
             const char* streams[] = {"q", "k", "v"};
             for (int si = 0; si < 3; ++si) {
@@ -2292,7 +2441,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
 
             GM_CHECK(gm_gemv(ws_("attn_q_b.weight"), A + sc_qr, nullptr, 1.0f, A + sc_q, g.n_head * g.qk_nope, g.q_lora), err);
             q_absorb_kernel<<<blocks((int64_t) g.kv_lora * g.n_head), GM_THREADS>>>(
-                W("attn_k_b.weight"), A + sc_q, A + sc_qabs, g.qk_nope, g.kv_lora, g.n_head, 1);
+                W("attn_k_b.weight"), A + sc_q, A + sc_qabs, g.qk_nope, g.kv_lora, g.n_head, 1, g.qk_nope);
 
             // the indexer: per-token key/gate into their buffers; a pool's key when it completes
             GM_CHECK(gm_gemv(ws_("indexer.attn_k.weight"), A + sc_x, nullptr,
@@ -2342,15 +2491,21 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                              A + sc_mixer, g.n_embd, (int64_t) g.n_head * g.v_head), err);
         }
 
-        // ---- hc write (ping-pong), then the FFN half
-        strata::kernels::glm_hc_post(A + sc_mixer, R, A + sc_post, A + sc_comb, hcs, S + g.hc * g.n_embd, nullptr);
-        R = S + g.hc * g.n_embd;
-        cb_dump("hc_attn_post-" + L, R, g.hc * g.n_embd);
-        strata::kernels::glm_hc_pre(R, W("hc_ffn_fn.weight"), W("hc_ffn_scale.weight"), W("hc_ffn_base.weight"),
-                                    g.norm_eps, g.hc_eps, hcs, hcws, A + sc_mixed, A + sc_pre, A + sc_post,
-                                    A + sc_comb, nullptr);
-        cb_dump("hc_ffn_pre-" + L, A + sc_mixed, g.n_embd);
-        rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_mixed, W("ffn_norm.weight"), A + sc_x, g.n_embd, 1, g.norm_eps);
+        // ---- hc write (ping-pong), then the FFN half (glm-dsa: residual += mixer, normed)
+        if (g.dsa) {
+            add_kernel<<<blocks(g.n_embd), GM_THREADS>>>(R, A + sc_mixer, R, g.n_embd);
+            cb_dump("ffn_inp-" + L, R, g.n_embd);
+            rms_norm_kernel<<<1, GM_THREADS>>>(R, W("ffn_norm.weight"), A + sc_x, g.n_embd, 1, g.norm_eps);
+        } else {
+            strata::kernels::glm_hc_post(A + sc_mixer, R, A + sc_post, A + sc_comb, hcs, S + g.hc * g.n_embd, nullptr);
+            R = S + g.hc * g.n_embd;
+            cb_dump("hc_attn_post-" + L, R, g.hc * g.n_embd);
+            strata::kernels::glm_hc_pre(R, W("hc_ffn_fn.weight"), W("hc_ffn_scale.weight"), W("hc_ffn_base.weight"),
+                                        g.norm_eps, g.hc_eps, hcs, hcws, A + sc_mixed, A + sc_pre, A + sc_post,
+                                        A + sc_comb, nullptr);
+            cb_dump("hc_ffn_pre-" + L, A + sc_mixed, g.n_embd);
+            rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_mixed, W("ffn_norm.weight"), A + sc_x, g.n_embd, 1, g.norm_eps);
+        }
         cb_dump("ffn_norm-" + L, A + sc_x, g.n_embd);
 
         if (il < g.dense_lead) {
@@ -2418,8 +2573,12 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
         }
         cb_dump("ffn_out-" + L, A + sc_ffn, g.n_embd);
 
-        strata::kernels::glm_hc_post(A + sc_ffn, R, A + sc_post, A + sc_comb, hcs, S, nullptr);
-        R = S;
+        if (g.dsa) {
+            add_kernel<<<blocks(g.n_embd), GM_THREADS>>>(R, A + sc_ffn, R, g.n_embd);
+        } else {
+            strata::kernels::glm_hc_post(A + sc_ffn, R, A + sc_post, A + sc_comb, hcs, S, nullptr);
+            R = S;
+        }
         cb_dump("l_out-" + L, R, g.hc * g.n_embd);
         if (timing_) {
             if (!tev_rec(tev_d_, "d")) timing_ = false;
@@ -3465,8 +3624,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     sc_g2 = take(g_.d_inner());
     sc_gated = take(g_.d_inner());
     sc_qr = take(g_.q_lora);
-    sc_kv = take(g_.kv_lora);
-    sc_q = take((int64_t) g_.n_head * g_.qk_nope);
+    sc_kv = take(g_.kv_lora + g_.n_rot);
+    sc_q = take((int64_t) g_.n_head * g_.k_mla());
     sc_qabs = take((int64_t) g_.kv_lora * g_.n_head);
     sc_iq = take((int64_t) g_.idx_heads * g_.idx_key);
     sc_iw = take(g_.idx_heads);
