@@ -4983,10 +4983,10 @@ __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ 
                                                       float eps, int n, block_q8_1* __restrict__ catq) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
-    float a[4], b[4];
+    float a[8], b[8];
     float sa = 0.0f, sb = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const int e = tid + 1024 * i;
         a[i] = e < n ? emb[e] : 0.0f;
         b[i] = e < n ? h[e] : 0.0f;
@@ -4997,7 +4997,7 @@ __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ 
     sb = block_sum(sb, sred);
     const float ia = rsqrtf(sa / (float) n + eps), ib = rsqrtf(sb / (float) n + eps);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const int e = tid + 1024 * i;
         if (e >= n) break;
         q8_1_store_warp(a[i] * ia * enorm[e], catq + e / 32, lane);
@@ -7109,7 +7109,7 @@ __global__ void __launch_bounds__(256) mla_pe_attend_kernel(const float* __restr
     const float scale = rsqrtf((float) (qk_nope + n_rot));
     float mx = -INFINITY;
     for (int s = tid; s < n_sel; s += blockDim.x) {
-        const int cell = cells[s];
+        const int cell = cells != nullptr ? cells[s] : s;
         const uint16_t* lr = lat + (size_t) kv_lora * cell;
         float dot = 0.0f;
         for (int c = 0; c < kv_lora; ++c) dot += qa[c] * __half2float(__ushort_as_half(lr[c]));
@@ -7128,7 +7128,8 @@ __global__ void __launch_bounds__(256) mla_pe_attend_kernel(const float* __restr
     __syncthreads();
     for (int c = tid; c < kv_lora; c += blockDim.x) {
         float acc = 0.0f;
-        for (int s = 0; s < n_sel; ++s) acc += prob[s] * __half2float(__ushort_as_half(lat[(size_t) kv_lora * cells[s] + c]));
+        for (int s = 0; s < n_sel; ++s)
+            acc += prob[s] * __half2float(__ushort_as_half(lat[(size_t) kv_lora * (cells != nullptr ? cells[s] : s) + c]));
         ctx[c] = acc * inv;
     }
     __syncthreads();

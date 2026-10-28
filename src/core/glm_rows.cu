@@ -278,7 +278,7 @@ bool Glm5Model::rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::
         tt->to_float(pack_emb_src_ + (size_t) tokens[i] * emb_row, c.emb_h, E);
         if (rw[i].img != nullptr) std::memcpy(c.emb_h, rw[i].img, (size_t) E * sizeof(float));
         cudaMemcpyAsync(F->emb, c.emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
-        gf::embed_streams(F->emb, rw[i].res, E, s);
+        embed_res(F->emb, rw[i].res, s);
     }
     return true;
 }
@@ -844,7 +844,7 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
     };
     // ---- the head: one read of the output matrix for every row, then each row's draw
     for (int i = 0; i < n; ++i)
-        gf::head_prep(rw[i].res, w_.at("output_norm.weight"), g.norm_eps, E, rows(S->head_x, E, i),
+        head_res(rw[i].res, rows(S->head_x, E, i),
                       rows_q(S->head_xq, E, i), s);
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, S->head_xq, S->head_x, S->logits, nullptr, 1.0f, ow.type, E, g.n_vocab};

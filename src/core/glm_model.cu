@@ -286,23 +286,45 @@ static const char* const kMtpF32[] = {"attn_norm.weight", "ffn_norm.weight", "at
                                       "indexer_compressor_ape.weight", "exp_probs_b.bias", "nextn.enorm.weight",
                                       "nextn.hnorm.weight", "nextn.shared_head_norm.weight"};
 
+// glm-dsa's block attends densely (llama.cpp glm-dsa graph_mtp): no indexer, no compressor
+static const char* const kMtpB16Dsa[] = {"ffn_gate_inp.weight", "attn_k_b.weight", "attn_v_b.weight"};
+static const char* const kMtpF32Dsa[] = {"attn_norm.weight", "ffn_norm.weight", "attn_q_a_norm.weight",
+                                         "attn_kv_a_norm.weight", "exp_probs_b.bias", "nextn.enorm.weight",
+                                         "nextn.hnorm.weight", "nextn.shared_head_norm.weight"};
+struct MtpNames {
+    std::vector<const char*> raw, b16, f32;
+};
+static MtpNames mtp_names(bool dsa) {
+    MtpNames m;
+    m.raw.assign(std::begin(kMtpRaw), std::end(kMtpRaw));
+    if (dsa) {
+        m.b16.assign(std::begin(kMtpB16Dsa), std::end(kMtpB16Dsa));
+        m.f32.assign(std::begin(kMtpF32Dsa), std::end(kMtpF32Dsa));
+    } else {
+        m.b16.assign(std::begin(kMtpB16), std::end(kMtpB16));
+        m.f32.assign(std::begin(kMtpF32), std::end(kMtpF32));
+    }
+    return m;
+}
+
 // ... and the VRAM they take
 static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const std::string&)>& find, int il,
-                           uint64_t& bytes, std::string& err) {
+                           uint64_t& bytes, std::string& err, bool dsa = false) {
     const std::string P = "blk." + std::to_string(il) + ".";
+    const MtpNames names = mtp_names(dsa);
     bytes = 0;
-    for (const char* n : kMtpRaw) {
+    for (const char* n : names.raw) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
                  ~(uint64_t) 255u;
     }
-    for (const char* n : kMtpB16) {
+    for (const char* n : names.b16) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
     }
-    for (const char* n : kMtpF32) {
+    for (const char* n : names.f32) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
@@ -1693,7 +1715,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         const strata::TensorInfo* tu = findm(P + "ffn_up_exps.weight");
         const strata::TensorInfo* td = findm(P + "ffn_down_exps.weight");
         if ((g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr && tg && tu && td &&
-            mtp_dense_vram(findm, L, b, e2)) {
+            mtp_dense_vram(findm, L, b, e2, g.dsa)) {
             blob[(size_t) L] = (tensor_bytes(tg) + tensor_bytes(tu) + tensor_bytes(td)) / g.n_expert;
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
             mtp_dense = (double) b;
@@ -3615,7 +3637,12 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // the indexer key / gate caches: a ring on the fast path (the prompt path's largest sub-batch + 64 positions; see
     // ik_ring_), the whole context on the reference path (whose kernels index them by position)
     ik_ring_ = fast_mode_ ? (int) std::min<int64_t>(max_ctx, 8192 + 64) : (int) max_ctx;
-    if (mtp_il_ >= 0) {
+    if (mtp_il_ >= 0 && g_.dsa) {   // glm-dsa's block: the latent and k_pe only (it attends densely)
+        dsa_lat_[(size_t) mtp_il_] = floats;
+        floats += lat_floats;
+        dsa_kpe_[(size_t) mtp_il_] = floats;
+        floats += (int64_t) g_.n_rot * max_ctx;
+    } else if (mtp_il_ >= 0) {
         dsa_lat_[(size_t) mtp_il_] = floats;
         floats += lat_floats;
         dsa_ik_[(size_t) mtp_il_] = floats;
@@ -3897,9 +3924,10 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         return true;   // a GGUF without the draft block
     }
     const auto x3 = [&](const std::string& n) { return exl3_ && xt.mats.count(n) != 0; };
-    const auto& raw_names = kMtpRaw;
-    const auto& b16_names = kMtpB16;
-    const auto& f32_names = kMtpF32;
+    const MtpNames names = mtp_names(g_.dsa);
+    const auto& raw_names = names.raw;
+    const auto& b16_names = names.b16;
+    const auto& f32_names = names.f32;
     uint64_t bytes = 0;
     if (exl3_) {
         for (const char* n : raw_names) {
@@ -3917,7 +3945,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
             bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
         }
-    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err)) {
+    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err, g_.dsa)) {
         return false;
     }
     if (cudaMalloc(&mtp_arena_, bytes) != cudaSuccess) {

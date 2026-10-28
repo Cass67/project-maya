@@ -347,7 +347,7 @@ bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32
                 tt->to_float(pack_emb_src_ + (size_t) tokens[row + t] * emb_row, e, E);
                 if (rw[row + t].img != nullptr) std::memcpy(e, rw[row + t].img, (size_t) E * sizeof(float));
                 cudaMemcpyAsync(F->emb, e, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
-                gf::embed_streams(F->emb, rw[row + t].res, E, s);
+                embed_res(F->emb, rw[row + t].res, s);
             }
     } else {
         for (int c = 0, row = 0; c < n; row += counts[c], ++c) {
@@ -371,7 +371,7 @@ bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32
     } else {
         // ---- the head: one read of the output matrix for every row, then each window's picks
         for (int i = 0; i < nr; ++i)
-            gf::head_prep(rw[i].res, w_.at("output_norm.weight"), g.norm_eps, E, row_at(S->head_x, E, i),
+            head_res(rw[i].res, row_at(S->head_x, E, i),
                           rowq_at(S->head_xq, E, i), s);
         const WSlot& ow = ws_map_.at("output.weight");
         gf::MvJob o = {ow.q, S->head_xq, S->head_x, S->logits, nullptr, 1.0f, ow.type, E, g.n_vocab};

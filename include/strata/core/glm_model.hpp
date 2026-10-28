@@ -582,6 +582,9 @@ public:
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
     bool fast_dsa_rope(int il, int64_t p, std::string& err);   // glm-dsa's mixer (roped MLA, token indexer)
     bool fast_layers_dsa(int64_t p, std::string& err);         // glm-dsa's plain-residual layer loop
+    // the residual's layout: glm5-next's 4 mHC streams, glm-dsa's one (embedding in; output_norm + q8_1 out)
+    void embed_res(const float* emb, float* R, cudaStream_t s) const;
+    void head_res(const float* R, float* x, void* xq, cudaStream_t s) const;
     bool fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wait = true);   // one MoE FFN (x -> ffn)
     bool moe_defer_wait_ = false;                            // (fast_moe's cpu_wait = false: the caller waits)
     // ... its routed experts, once the router and the shared expert's gate / up have run: the token path's own

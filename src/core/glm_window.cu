@@ -1045,7 +1045,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         }
         cudaMemcpyAsync(W.emb, W.emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, F->cs);
         for (int t = 0; t < T; ++t)
-            gf::embed_streams(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, E, F->cs);
+            embed_res(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, F->cs);
     }
     if (!fast_window_layers(p0, T, err)) return false;
     // each later part: the rows cross over through the previous part's pinned buffer, ordered on the devices
@@ -1068,8 +1068,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
     auto& WT = FT->win;
     cudaSetDevice(tail->dev_);
     for (int t = 0; t < T; ++t)
-        gf::head_prep(WT.R[WT.out] + (size_t) t * hcE, tail->w_.at("output_norm.weight"), g.norm_eps, E,
-                      WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
+        tail->head_res(WT.R[WT.out] + (size_t) t * hcE, WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
     const WSlot& ow = tail->ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, WT.head_xq, WT.head_x, WT.logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
@@ -1248,7 +1247,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     if (prev == nullptr) {
         cudaMemcpyAsync(W.emb + (size_t) sl * E, W.emb_h + (size_t) sl * E, (size_t) E * sizeof(float),
                         cudaMemcpyHostToDevice, F->cs);
-        gf::embed_streams(W.emb + (size_t) sl * E, m->state_, E, F->cs);
+        embed_res(W.emb + (size_t) sl * E, m->state_, F->cs);
     } else {
         cudaStreamWaitEvent(F->cs, prev->fast_->win.ev_tok[sl], 0);
         cudaMemcpyAsync(m->state_, prev->fast_->win.hop_h + (size_t) sl * hcE, hcE * sizeof(float),
@@ -1274,7 +1273,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     float* hx = W.head_x + (size_t) sl * E;
     void* hq = (uint8_t*) W.head_xq + (size_t) sl * W.xq_s;
     float* lg = W.logits + (size_t) sl * g.n_vocab;
-    gf::head_prep(m->state_, m->w_.at("output_norm.weight"), g.norm_eps, E, hx, hq, F->cs);
+    m->head_res(m->state_, hx, hq, F->cs);
     const WSlot& ow = m->ws_map_.at("output.weight");
     if (m->head_split_ready()) {
         if (!m->win_head_split(t, sl, hx, lg, err)) return false;

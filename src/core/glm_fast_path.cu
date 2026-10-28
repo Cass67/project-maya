@@ -757,6 +757,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.kv_a = q_or_b16("attn_kv_a_mqa.weight", g.n_embd, g.kv_lora);
             Ly.q_a_norm = f32("attn_q_a_norm.weight");
             Ly.kv_a_norm = f32("attn_kv_a_norm.weight");
+            if (!(g.dsa && is_mtp)) {   // (glm-dsa's draft block attends densely: no indexer)
             Ly.k_norm_w = f32("indexer.k_norm.weight");
             Ly.k_norm_b = f32("indexer.k_norm.bias");
             if (!g.dsa) {   // (glm-dsa's indexer scores tokens: no compressor)
@@ -770,6 +771,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             else
                 Ly.idx_q_b = b16("indexer.attn_q_b.weight");
             Ly.idx_proj = b16("indexer.proj.weight");
+            }
             Ly.k_b = b16("attn_k_b.weight");
             Ly.v_b = b16("attn_v_b.weight");
         }
@@ -5611,6 +5613,20 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     return true;
 }
 
+void Glm5Model::embed_res(const float* emb, float* R, cudaStream_t s) const {
+    if (g_.dsa)
+        cudaMemcpyAsync(R, emb, (size_t) g_.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    else
+        gf::embed_streams(emb, R, g_.n_embd, s);
+}
+
+void Glm5Model::head_res(const float* R, float* x, void* xq, cudaStream_t s) const {
+    if (g_.dsa)   // (rms_q8 writes h only when it adds)
+        gf::rms_q8(const_cast<float*>(R), nullptr, w_.at("output_norm.weight"), g_.norm_eps, g_.n_embd, x, xq, s);
+    else
+        gf::head_prep(R, w_.at("output_norm.weight"), g_.norm_eps, g_.n_embd, x, xq, s);
+}
+
 // ---- glm-dsa (GLM-5.3): roped MLA over the token indexer's selection (ref/glm_dsa.py GlmDsa.attention).  F->x / xq
 // -> F->mixer.  A full indexer layer scores every visible token and keeps top_k (all of them while p + 1 <= top_k);
 // a shared one reuses the previous full layer's cells (F->cells, F->dsa_n_sel).
@@ -5620,7 +5636,8 @@ bool Glm5Model::fast_dsa_rope(int il, int64_t p, std::string& err) {
     cudaStream_t s = F->cs;
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     const auto& Ly = F->L[(size_t) il];
-    const bool full = g.indexer_full[(size_t) il] != 0;
+    const bool dense = il == mtp_il_;   // the draft block attends every position (llama.cpp glm-dsa graph_mtp)
+    const bool full = !dense && g.indexer_full[(size_t) il] != 0;
     const int n_vis = (int) p + 1;
     const bool all = n_vis <= g.idx_top_k && gf::dsa_select_all_on();
     gf::MvJob j[4];
@@ -5673,12 +5690,12 @@ bool Glm5Model::fast_dsa_rope(int il, int64_t p, std::string& err) {
             gf::dsa_score(F->iq, ik, F->iw, g.idx_key, g.idx_heads, n_vis, F->score, s, true);
             gf::dsa_select(F->score, n_vis, 1, F->dsa_n_sel, F->dsa_n_sel, (int) p, F->cells, s);
         }
-    } else if (F->dsa_n_sel <= 0) {
+    } else if (!dense && F->dsa_n_sel <= 0) {
         err = "glm fast: glm-dsa layer " + std::to_string(il) + " shares an indexer selection this part never made";
         return false;
     }
-    gf::mla_pe(F->q, g.k_mla(), g.qk_nope, g.n_rot, Ly.k_b, Ly.v_b, lat, kpe, F->cells, F->dsa_n_sel, g.n_head,
-               g.kv_lora, g.v_head, F->qabs, F->attn_q, s);
+    gf::mla_pe(F->q, g.k_mla(), g.qk_nope, g.n_rot, Ly.k_b, Ly.v_b, lat, kpe, dense ? nullptr : F->cells,
+               dense ? n_vis : F->dsa_n_sel, g.n_head, g.kv_lora, g.v_head, F->qabs, F->attn_q, s);
     if (dumps) fast_dump(s, "kqv_out-" + std::to_string(il), F->qabs + (size_t) g.n_head * g.kv_lora,
                          (int64_t) g.n_head * g.v_head);
     gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head, g.n_embd};
@@ -5702,6 +5719,11 @@ bool Glm5Model::fast_layers_dsa(int64_t p, std::string& err) {
     bool pf_pending = false;
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
+        // (fast_layers' gates: a pipelined window's token past a wrong draft, the two-half decode's cancelled pass -
+        // their heavy kernels then do nothing)
+        if (F->win.pipe_t >= 0 && F->win.from != nullptr && F->win.skip_d != nullptr && (F->win.pipe_t > 0 || il == l0_))
+            gf::skip_gate(F->win.from, F->win.pipe_t, F->win.skip_d, s);
+        if (F->spec_gate) gf::skip_gate(F->spec_live_h, 0, F->spec_skip_d, s);
         gf::rms_q8(state_, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
         if (dumps) {
             if (il != l0_) fast_dump(s, "l_out-" + std::to_string(il - 1), state_, g.n_embd);
@@ -5956,7 +5978,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     if (g.dsa)   // glm-dsa: one residual stream
         cudaMemcpyAsync(state_, F->emb, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
     else
-        gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+        embed_res(F->emb, state_, F->cs);
     if (!fast_layers(p, false, err)) return false;
     // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
     // copy ordered on the devices by an event (the host never waits between the parts)
@@ -5981,8 +6003,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         gf::rms_q8(tail->state_, nullptr, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x,
                    FT->head_xq, FT->cs);
     else
-        gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
-                      FT->cs);
+        tail->head_res(tail->state_, FT->head_x, FT->head_xq, FT->cs);
     // GLM_DUMP_H=<file> (debug): append every position's final hidden state (output_norm of the stream mean - what the
     // NextN/MTP block reads) as n_embd floats
     static const char* dh = getenv("GLM_DUMP_H");
@@ -6110,7 +6131,7 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     }
     gf::rms_q8(F->mtp_h, nullptr, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
     if (glmfast::submit_every() > 0) glmfast::submit_queued(s);   // (Windows HIP: the GPU starts while the rest queues)
-    if (!fast_dsa(il, p, err)) return false;
+    if (!(g.dsa ? fast_dsa_rope(il, p, err) : fast_dsa(il, p, err))) return false;
     gf::rms_q8(F->mtp_h, F->mixer, Ly.ffn_norm, g.norm_eps, E, F->x, F->xq, s);
     bool pf_pending = false;
     if (!fast_moe(il, pf_pending, err)) return false;
@@ -6627,7 +6648,7 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
                  g.n_embd);
     if (const float* img = image_row(p)) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
-    gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+    embed_res(F->emb, state_, F->cs);
     lap(2);
     if (cancellable) {
         F->spec_gate = true;            // a skip_gate before each layer ...
@@ -6708,7 +6729,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             if (!m->hop_to_next(m->split_next_.get(), p, err)) return false;
         cudaSetDevice(m->dev_);
         FastState* FL = m->fast_;
-        gf::head_prep(m->state_, m->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FL->head_x, FL->head_xq, FL->cs);
+        m->head_res(m->state_, FL->head_x, FL->head_xq, FL->cs);
         const WSlot& owl = m->ws_map_.at("output.weight");
         gf::MvJob ol = {owl.q, FL->head_xq, FL->head_x, m->sc_ + m->sc_logits, nullptr, 1.0f, owl.type, g.n_embd,
                         g.n_vocab};
@@ -6723,7 +6744,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         cudaSetDevice(dev_);
         return true;
     }
-    gf::head_prep(state_, w_.at("output_norm.weight"), g.norm_eps, g.n_embd, F->head_x, F->head_xq, F->cs);
+    head_res(state_, F->head_x, F->head_xq, F->cs);
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, F->head_xq, F->head_x, sc_ + sc_logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;

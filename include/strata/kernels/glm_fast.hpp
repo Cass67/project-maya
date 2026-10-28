@@ -463,7 +463,8 @@ void dsa_rope_prep(const DsaRopePrepArgs& a, cudaStream_t s);
 /// ggml rope NORM on the first n_rot floats of n_head heads (head h at x + stride * h), at position pos.
 void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base, cudaStream_t s);
 /// glm-dsa's absorbed MLA for one token: q heads of [nope (qk_nope) | rope (n_rot)] k_mla apart; scores q_abs . latent +
-/// q_pe . k_pe over the cells, / sqrt(qk_nope + n_rot); out_h = wv_b_h . ctx as q8_1.  scratch: n_head x (kv_lora + v_head).
+/// q_pe . k_pe over the cells (nullptr: every position 0 .. n_sel-1, the dense NextN block), / sqrt(qk_nope + n_rot);
+/// out_h = wv_b_h . ctx as q8_1.  scratch: n_head x (kv_lora + v_head).
 void mla_pe(const float* q, int k_mla, int qk_nope, int n_rot, const uint16_t* wk_b, const uint16_t* wv_b,
             const uint16_t* lat, const float* kpe, const int* cells, int n_sel, int n_head, int kv_lora, int v_head,
             float* scratch, void* out_q8_1, cudaStream_t s);
@@ -471,7 +472,7 @@ void mla_pe(const float* q, int k_mla, int qk_nope, int n_rot, const uint16_t* w
 /// tab[keys[i]] = vals[i] for i < n (the expert-table edits the host queues between tokens).
 void tab_update(unsigned long long* tab, const int* keys, const unsigned long long* vals, int n, cudaStream_t s);
 
-/// The NextN block's input: cat = [rms(emb) * enorm, rms(h) * hnorm] (2 n values) as q8_1.  n <= 4096.
+/// The NextN block's input: cat = [rms(emb) * enorm, rms(h) * hnorm] (2 n values) as q8_1.  n <= 8192.
 void mtp_in(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int n, void* cat_q8_1,
             cudaStream_t s);
 /// h += add (add may be null), then x = rms(h) * w and its q8_1 (a plain pre-norm residual step).  n <= 8192.
