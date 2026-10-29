@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include "glm_cpu_decode_bench.hpp"
 
 int main(int argc, char** argv) {
     strata::platform::numa_local_policy();   // (before any thread: out of the kernel's NUMA balancing)
@@ -90,6 +91,16 @@ int main(int argc, char** argv) {
             if (in) ids.push_back((int32_t) v);
             std::fclose(f);
         }
+    }
+    // A fast-prefilled, snapshot-restored full-model comparison at arbitrary context depth.
+    if (const char* prefix = getenv("GLM_TEST_CPU_AB_PREFIX")) {
+        const int k = std::atoi(prefix);
+        const int count = getenv("GLM_TEST_DECODE_COMPARE") ? std::atoi(getenv("GLM_TEST_DECODE_COMPARE")) : 400;
+        const char* threads = getenv("GLM_TEST_LANE_THREADS");
+        if (k + count >= max_ctx || !glm_cpu_decode_bench(model, ids, k, count, threads ? threads : "64", err)) {
+            std::fprintf(stderr, "CPU_AB failed: %s\n", err.c_str()); return 1;
+        }
+        std::fprintf(stderr, "CPU_AB PASS\n"); return 0;
     }
     // GLM_TEST_WARM=N: run the sequence N times first (then reset) - the fast path's expert tiers fill, so the
     // recorded pass runs its experts where a warm decode would (VRAM), not on the cold CPU path
@@ -298,11 +309,22 @@ int main(int argc, char** argv) {
                 return true;
             };
             if (const char* lt = getenv("GLM_TEST_LANE_THREADS")) {   // "40,44,56": the MTP decode, every miss on the CPU
+                const bool plane_ab = getenv("GLM_TEST_CPU_PLANES_AB") != nullptr;
+                if (plane_ab) model.set_cpu_plane_cache(false);
                 if (!bench("no-mtp", false, 0, -1)) return 1;
                 for (const char* q = lt; *q;) {
                     const int th = std::atoi(q);
                     const std::string nm = "lane-" + std::to_string(th);
-                    if (th > 0 && !bench(nm.c_str(), true, th, 0.0)) {
+                    if (th > 0 && plane_ab) {
+                        for (int trial = 0; trial < 4; ++trial) {
+                            const bool on = trial == 1 || trial == 2;
+                            model.set_cpu_plane_cache(on);
+                            const std::string ab = "plane-" + std::string(on ? "on-" : "off-") + std::to_string(th) + "-" + std::to_string(trial);
+                            if (!bench(ab.c_str(), true, th, 0.0)) {
+                                std::fprintf(stderr, "plane A/B: %s\n", err.c_str()); return 1;
+                            }
+                        }
+                    } else if (th > 0 && !bench(nm.c_str(), true, th, 0.0)) {
                         std::fprintf(stderr, "decode comparison: %s\n", err.c_str());
                         return 1;
                     }

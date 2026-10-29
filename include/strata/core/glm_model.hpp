@@ -191,6 +191,8 @@ public:
     int cpu_lane_threads() const;
     int cpu_lane_threads_max() const;
     bool set_cpu_lane_threads(int n);
+    // Diagnostic switch between requests; a cache must have been built with STRATA_GLM_CPU_PLANES.
+    void set_cpu_plane_cache(bool enabled);
     /// The decode's disk reads: each expert read from the SSD in 3 x n pieces at once (STRATA_GLM_READ_CHUNKS, 8).
     /// set_read_chunks(n): n (1-16) from the next read on, n <= 0 the engine's own - for setup's calibration (per
     /// request, no restart): the best size depends on the drive, its driver and the CPU

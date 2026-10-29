@@ -21,6 +21,7 @@
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/iq2_plane.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
 #include "strata/platform/idle_gate.hpp"
@@ -2567,13 +2568,30 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
     const int T = threads * (kSplit > 0 ? kSplit : std::max(1, std::min(8, 48 / std::max(1, threads))));
     kc::native_quant_act(nf, x, act);
     const int gu_tot = ne * n_ff;
+#ifdef STRATA_NATIVE_EXPERTS
+    const uint8_t* plane[8] = {};
+    const size_t plane_row = kc::iq2_plane_row_bytes(n_embd);
+    if (ne <= 8 && plane_row && !F->cpu_iq2_planes.empty() && F->cpu_iq2_planes_enabled.load(std::memory_order_relaxed)) {
+        const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+        if (R.per_part == 0) for (int i = 0; i < ne; ++i) {
+            const uintptr_t p = reinterpret_cast<uintptr_t>(blob[i]), b = reinterpret_cast<uintptr_t>(R.base);
+            if (p < b || p - b >= (size_t) R.n * R.stride || (p - b) % R.stride) continue;
+            const int key = R.key[(p - b) / R.stride];
+            if (key >= 0 && (size_t) key < F->cpu_iq2_planes.size()) plane[i] = F->cpu_iq2_planes[(size_t) key].get();
+        }
+    }
+#endif
     pool.run(T, [&](int job) {
         const void* a[1] = {act};
         const int q1 = (int) ((int64_t) gu_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) gu_tot * job / T); q < q1;) {
             const int i = q / n_ff, r0 = q % n_ff, r1 = std::min(n_ff, r0 + (q1 - q));
             float* o[1] = {ff + (size_t) i * n_ff};
-            kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp);
+#ifdef STRATA_NATIVE_EXPERTS
+            if (plane[i]) kc::iq2_plane_gu_rows(plane[i], plane[i] + plane_row * n_ff, act, o[0], r0, r1, g.swiglu_exp);
+            else
+#endif
+                kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp);
             q += r1 - r0;
         }
     });
@@ -2586,7 +2604,12 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
             const int i = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
             const void* h[1] = {hq + (size_t) i * kc::kNativeHBytes};
             float* o[1] = {dn + (size_t) i * n_embd};
-            kc::native_down_rows_split(nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
+#ifdef STRATA_NATIVE_EXPERTS
+            if (F->cpu_iq2_plane_mode >= 2 && plane[i] && nf.d_type == 18)
+                kc::iq3_nibble_down_rows(plane[i] + 2 * plane_row * n_ff, h[0], o[0], r0, r1, n_ff);
+            else
+#endif
+                kc::native_down_rows_split(nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
             q += r1 - r0;
         }
     });
@@ -3244,6 +3267,57 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         F->cpu_node = pin_node;
         F->cpu_pin = pin_cpus;
     }
+    // Experimental lossless CPU planes. Snapshot held experts by immutable key before services start; newly demoted
+    // uncached experts use the native path. GPU transfers and prefill continue to consume the original GGUF bytes.
+#if defined(__linux__) && defined(STRATA_NATIVE_EXPERTS)
+    if (const char* cp = getenv("STRATA_GLM_CPU_PLANES"); cp && std::atoi(cp) != 0 &&
+        kc::iq2_plane_available() && g.n_embd == 6144 && g.n_ff_exp == 2048) {
+        const size_t row = kc::iq2_plane_row_bytes((int) g.n_embd);
+        const size_t one = row * (size_t) g.n_ff_exp;
+        const size_t down_row = kc::iq3_nibble_row_bytes((int) g.n_ff_exp);
+        F->cpu_iq2_plane_mode = std::atoi(cp) >= 2 ? 2 : 1;
+        F->cpu_iq2_planes.resize(F->ram_of.size());
+        size_t packed = 0, allocated = 0;
+        const auto begin = std::chrono::steady_clock::now();
+        for (auto& R : F->rc) for (int s = 0; s < R.n; ++s) {
+            const int key = R.key[(size_t) s], il = key >= 0 ? key / g.n_expert : -1;
+            if (key < 0 || (size_t) key >= F->cpu_iq2_planes.size() || il < l0_ || il >= lt_ ||
+                R.st[(size_t) s] != FastState::kRHold || F->cpu_fmt[(size_t) il].gu_type != 17) continue;
+            const auto& layer = F->L[(size_t) il];
+            const auto& fmt = F->cpu_fmt[(size_t) il];
+            const bool pack_down = F->cpu_iq2_plane_mode >= 2 && fmt.d_type == 18;
+            const size_t bytes = 2 * one + (pack_down ? down_row * (size_t) g.n_embd : 0);
+            auto* p = (uint8_t*) mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) break;
+            unsigned long mask[4] = {};
+            for (int node : numa_nodes()) if (node >= 0 && node < 256) mask[node / 64] |= 1ul << (node % 64);
+            if (mask[0] || mask[1] || mask[2] || mask[3])
+                if (syscall(SYS_mbind, p, bytes, 3 /* MPOL_INTERLEAVE */, mask, 256, 0u) != 0) {
+                    munmap(p, bytes); break;
+                }
+            madvise(p, bytes, MADV_NOHUGEPAGE);
+            const uint8_t* raw = R.slot((size_t) s);
+            F->cpu_pool->run(threads, [&](int job) {
+                const int r0 = (int) (g.n_ff_exp * job / threads), r1 = (int) (g.n_ff_exp * (job + 1) / threads);
+                kc::iq2_plane_repack(raw + fmt.gu_row * r0, p + row * r0, r1 - r0);
+                kc::iq2_plane_repack(raw + layer.gu_bytes + fmt.gu_row * r0, p + one + row * r0, r1 - r0);
+                if (pack_down) {
+                    const int d0 = (int) (g.n_embd * job / threads), d1 = (int) (g.n_embd * (job + 1) / threads);
+                    kc::iq3_nibble_repack(raw + layer.down_off + fmt.d_row * d0, p + 2 * one + down_row * d0,
+                                          d1 - d0, (int) g.n_ff_exp);
+                }
+            });
+            F->cpu_iq2_planes[(size_t) key] = std::shared_ptr<uint8_t>(p, [bytes](uint8_t* q) { munmap(q, bytes); });
+            allocated += bytes;
+            if (++packed % 512 == 0)
+                std::fprintf(stderr, "glm CPU planes: CUDA%d %zu experts, %.2f GiB, %.1f s\n", dev_, packed,
+                    allocated / 1073741824.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+        }
+        std::fprintf(stderr, "glm CPU planes: CUDA%d ready mode=%d, %zu experts, %.2f GiB, %.1f s; uncached experts use native\n",
+            dev_, F->cpu_iq2_plane_mode, packed, allocated / 1073741824.0,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    }
+#endif
     // one GPU with a DFlash drafter on two NUMA nodes or more: a verify window's tokens on both sockets (win_lane) - the
     // pool then pinned to the GPU's node, a second one on another node.  A decode's one token keeps its node's pool
     // (one token's experts across both sockets measured no faster); a window's tokens are separate answers, so the
@@ -4231,6 +4305,11 @@ bool Glm5Model::set_cpu_lane_threads(int n) {
         any = true;
     }
     return any;
+}
+
+void Glm5Model::set_cpu_plane_cache(bool enabled) {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (m->fast_ != nullptr) m->fast_->cpu_iq2_planes_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 void Glm5Model::set_miss_skip(double w, int from) {
@@ -5375,7 +5454,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         // (the refill into FREE slots runs whatever the plan: a slot a prompt's lending gave back holds nothing - a
         // split whose cards send one of 7-8 RAM-tier experts over PCIe left ~13% of VRAM empty after a long prompt;
         // the swaps below stay with the all-CPU plan, beside which the routes' own promotions do not run)
-        if (bg_n > 0 && !F->bg_hold && (int) F->bg.size() < 2 * bg_up_max) {
+        if ((bg_n > 0 || bg_fill > 0) && !F->bg_hold && (int) F->bg.size() < 2 * bg_up_max) {
             struct Cand {
                 uint32_t hot, cold;
                 int il, e, rs, free_slot, cold_slot;
@@ -7334,7 +7413,7 @@ bool Glm5Model::snapshot_save() {
         m->snap_pos_ = pos_;
         m->snap_pool_copy(false);
         cudaStreamSynchronize(m->fast_->cs);
-        if (m->snap_pool_ == nullptr && !m->dsa_layers().empty()) {
+        if (g.idx_kpool > 1 && m->snap_pool_ == nullptr && !m->dsa_layers().empty()) {
             cudaSetDevice(dev_);
             return false;
         }

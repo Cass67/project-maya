@@ -824,6 +824,10 @@ struct Glm5Model::FastState {
     unsigned int* dcnt_d = nullptr;                          // the device's route counts (the coldest go to the host)
     std::vector<strata::kernels::cpu::NativeFmt> cpu_fmt;   // per layer; n_ff == 0: the lane skips that layer
     std::vector<uint8_t> cpu_act, cpu_hq;                    // x's activation quant; 8 h quants
+    // Optional immutable CPU-only IQ2_XS planes, indexed by expert key. RAM slots may be reused: never index by pointer alone.
+    std::vector<std::shared_ptr<uint8_t>> cpu_iq2_planes;
+    std::atomic<bool> cpu_iq2_planes_enabled{true};
+    int cpu_iq2_plane_mode = 1; // 1: plane gate/up; 2: additionally signed-nibble IQ3_XXS down
     std::vector<float> cpu_ff, cpu_dn;                       // 8 x n_ff; 8 x n_embd
     struct CpuWin {                                          // a merged window layer (win_cpu_merged):
         std::vector<uint8_t> act, hq;                        // each token's activation quant; each entry's h quant
