@@ -1782,7 +1782,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
         const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
         const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
         int n_sel_max, int n_head, float scale, float* __restrict__ ctx, bool q8,
-        const float* __restrict__ q_pe, int q_pe_hs, const float* __restrict__ kpe, int n_rot) {
+        const float* __restrict__ q_pe, int q_pe_hs, const float* __restrict__ kpe, int n_rot, int lat_ld, int kpe_ld) {
     __shared__ __align__(16) _Float16 sl[16][512];
     __shared__ float sqpe[16][64];   // glm-dsa: the 16 heads' roped query part (n_rot <= 64)
     __shared__ __align__(16) _Float16 ph[16][16], pl[16][16];
@@ -1822,7 +1822,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
             const int r = i / 64, col = (i % 64) * 8, cell = cells[r];
             *(uint4*)(&sl[r][col]) = cell < 0 ? make_uint4(0, 0, 0, 0)
                 : q8 ? lat8_h8(lat8_rec(lat, 512, cell), 512, col / 8)
-                     : *(const uint4*)(lat + (size_t)cell * 512 + col);
+                     : *(const uint4*)(lat + (size_t)cell * lat_ld + col);
         }
         __syncthreads();
         mla2_f8 dot = {};
@@ -1843,7 +1843,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
 #pragma unroll
         for (int w = 0; w < 8; ++w) v += scores[w][r][col];
         if (q_pe != nullptr && cells[col] >= 0) {
-            const float* kr = kpe + (size_t)cells[col] * n_rot;
+            const float* kr = kpe + (size_t)cells[col] * kpe_ld;
             for (int e = 0; e < n_rot; ++e) v += sqpe[r][e] * kr[e];
         }
         v = cells[col] < 0 ? -INFINITY : v * scale;
@@ -2624,9 +2624,10 @@ bool mla_wmma2_default() { const int a = mla_wmma2_arch(); return a == 1 || a ==
 
 void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
                     int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8,
-                    const float* q_pe, int q_pe_hs, const float* kpe, int n_rot) {
+                    const float* q_pe, int q_pe_hs, const float* kpe, int n_rot, int lat_ld, int kpe_ld) {
     if (T <= 0) return;
-    if (kv_lora != 512 || n_head % 16 != 0) {
+    if (kpe_ld <= 0) kpe_ld = n_rot;
+    if (kv_lora != 512 || n_head % 16 != 0 || lat_ld < 512 || lat_ld % 8 != 0) {
         std::fprintf(stderr, "glm_batch mla_attn_wmma2: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
         return;
     }
@@ -2636,7 +2637,7 @@ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, c
         return;
     }
     mla_attn_wmma2_kernel<<<grid, 256, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8, q_pe,
-                                               q_pe_hs, kpe, n_rot);
+                                               q_pe_hs, kpe, n_rot, lat_ld, kpe_ld);
     check("mla_attn_wmma2");
 }
 #endif
