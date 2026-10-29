@@ -1170,8 +1170,10 @@ bool Glm5Model::prefill_setup(std::string& err) {
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
     const char* mb_env = getenv("STRATA_GLM_PREFILL_MB");
     const size_t gbuf = has_moe ? (size_t) PrefillState::NG * PrefillState::GE * gstride : 0;
-    // the prestage buffer (the ring): one GPU (a split's parts hold most of their experts); STRATA_GLM_PRESTAGE=<slots>
-    int ring_max = has_moe && n_parts_ == 1 ? kPreSlots : 0;
+    // the prestage buffer (the ring): one GPU (a split's parts hold most of their experts) - and glm-dsa's splits, whose
+    // parts hold ~20% (UD-Q2_K_XL on 4x 20 GB: 8190-token prompt 173 -> 241 tok/s, staging during the MoE 25-29 -> 3-4
+    // GB a card a chunk); STRATA_GLM_PRESTAGE=<slots>
+    int ring_max = has_moe && (n_parts_ == 1 || g.dsa) ? kPreSlots : 0;
     if (const char* v = getenv("STRATA_GLM_PRESTAGE")) ring_max = has_moe ? std::max(0, std::atoi(v)) : 0;
     // A COMPLETE pool to come (fast_setup: every expert and the spares in each layer's main slots, this path's buffers
     // in the tail beyond them - the Windows APU's carve-out): no expert is outside VRAM, so there is nothing to prestage
