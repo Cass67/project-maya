@@ -266,7 +266,10 @@ int main(int argc, char** argv) {
                 const auto before = model.fast_stats();
                 const uint64_t offers = model.spec_steps_, accepts = model.spec_hits_;
                 const auto begin = std::chrono::steady_clock::now();
-                if (spec && std::strncmp(name, "win", 3) == 0) {   // the MTP verify window (decode_mtp)
+                if (spec && std::strncmp(name, "dfl", 3) == 0) {   // the DFlash2 drafter (decode_dflash: 7 drafts, p_min 0)
+                    int64_t produced = 0;
+                    if (!model.decode_dflash(sp, count, 7, 0.0f, [&](int tok) { generated.push_back(tok); return true; }, produced, err)) return false;
+                } else if (spec && std::strncmp(name, "win", 3) == 0) {   // the MTP verify window (decode_mtp)
                     int64_t produced = 0;
                     if (!model.decode_mtp(sp, count, [&](int tok) { generated.push_back(tok); return true; }, produced, err)) return false;
                 } else if (spec) {
@@ -292,7 +295,12 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return true;
             };
-            if (model.mtp_ready()) {   // (STRATA_GLM_SPLIT_MTP=1 on a split: the window against the token path and spec)
+            if (model.dflash_ready()) {   // (STRATA_GLM_DFLASH: the drafter against the token path)
+                if (!bench("no-mtp", false, 0, -1) || !bench("dflash", true, 0, -1) || !bench("dflash-repeat", true, 0, -1)) {
+                    std::fprintf(stderr, "decode comparison: %s\n", err.c_str());
+                    return 1;
+                }
+            } else if (model.mtp_ready()) {   // (STRATA_GLM_SPLIT_MTP=1 on a split: the window against the token path and spec)
                 if (!bench("no-mtp", false, 0, -1) || !bench("win-mtp", true, 0, -1) || !bench("mtp-default", true, 0, -1) ||
                     !bench("win-mtp-repeat", true, 0, -1)) {
                     std::fprintf(stderr, "decode comparison: %s\n", err.c_str());
