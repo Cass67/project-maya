@@ -662,6 +662,16 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", out.norm_eps, ok);
     out.n_expert = (int) num("expert_count", out.n_expert, ok);
     out.n_exp_used = (int) num("expert_used_count", out.n_exp_used, ok);
+    // STRATA_GLM_EXPERTS=<n>: route each token to its top n experts instead of the GGUF's (n below it only; the
+    // router renormalizes the n weights as it does the full set).  Fewer expert reads a token, at a quality cost.
+    if (const char* ev = getenv("STRATA_GLM_EXPERTS")) {
+        const int n = std::atoi(ev);
+        if (n >= 1 && n < out.n_exp_used) {
+            std::fprintf(stderr, "glm5_model: STRATA_GLM_EXPERTS=%d: %d of the model's %d experts a token\n", n, n,
+                         out.n_exp_used);
+            out.n_exp_used = n;
+        }
+    }
     out.n_ff_exp = (int) num("expert_feed_forward_length", out.n_ff_exp, ok);
     out.n_shared = (int) num("expert_shared_count", out.n_shared, ok);
     out.n_ff_dense = (int) num("feed_forward_length", out.n_ff_dense, ok);
