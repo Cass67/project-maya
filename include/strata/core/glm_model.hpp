@@ -760,6 +760,9 @@ public:
     /// samples.  On by default on the Strix / Gorgon Halo APUs (gfx115x, mtp_decode_default); STRATA_GLM_MTP_DECODE=1
     /// elsewhere, =0 off.  mtp_ready(): this model was set up for it.
     static bool mtp_decode_wanted(int dev, int n_parts);
+    static bool split_mtp_wanted();               // STRATA_GLM_SPLIT_MTP=1: glm-dsa's MTP decode across a split
+    const Glm5Model* mtp_owner() const;           // the part that drafts (this, or a glm-dsa split's last part)
+    Glm5Model* mtp_owner() { return const_cast<Glm5Model*>(static_cast<const Glm5Model*>(this)->mtp_owner()); }
     bool mtp_ready() const;
     bool decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                     int64_t& produced, std::string& err);

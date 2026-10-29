@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -265,7 +266,10 @@ int main(int argc, char** argv) {
                 const auto before = model.fast_stats();
                 const uint64_t offers = model.spec_steps_, accepts = model.spec_hits_;
                 const auto begin = std::chrono::steady_clock::now();
-                if (spec) {
+                if (spec && std::strncmp(name, "win", 3) == 0) {   // the MTP verify window (decode_mtp)
+                    int64_t produced = 0;
+                    if (!model.decode_mtp(sp, count, [&](int tok) { generated.push_back(tok); return true; }, produced, err)) return false;
+                } else if (spec) {
                     int64_t produced = 0;
                     if (!model.decode_spec(sp, count, [&](int tok) { generated.push_back(tok); return true; }, produced, err)) return false;
                 } else {
@@ -288,7 +292,13 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return true;
             };
-            if (!bench("no-mtp", false, 0, -1) || !bench("mtp-default", true, 0, -1) ||
+            if (model.mtp_ready()) {   // (STRATA_GLM_SPLIT_MTP=1 on a split: the window against the token path and spec)
+                if (!bench("no-mtp", false, 0, -1) || !bench("win-mtp", true, 0, -1) || !bench("mtp-default", true, 0, -1) ||
+                    !bench("win-mtp-repeat", true, 0, -1)) {
+                    std::fprintf(stderr, "decode comparison: %s\n", err.c_str());
+                    return 1;
+                }
+            } else if (!bench("no-mtp", false, 0, -1) || !bench("mtp-default", true, 0, -1) ||
                 !bench("mtp-cpu20", true, 20, -1) || !bench("mtp-cpu10", true, 10, -1) ||
                 !bench("mtp-pcie0", true, 0, 0.0) || !bench("mtp-pcie0.5", true, 0, 0.5) ||
                 !bench("mtp-default-repeat", true, 0, -1)) {

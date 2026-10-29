@@ -863,6 +863,81 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     const auto mark = [&](const char* nm) {
         if (prof) W.mark(nm, s);
     };
+    const auto dense_ffn = [&](int il, int t0, int n) -> bool {
+        const auto& Ly = F->L[(size_t) il];
+        const void* xq0 = (const uint8_t*) W.xq + (size_t) t0 * W.xq_s;
+        const float* x0 = W.x + (size_t) t0 * E;
+        gf::MvJob j[2];
+        j[0] = {Ly.ffn_gate.q, xq0, x0, W.dg + (size_t) t0 * g.n_ff_dense, nullptr, 1.0f, Ly.ffn_gate.type, E,
+                g.n_ff_dense};
+        j[1] = {Ly.ffn_up.q, xq0, x0, W.du + (size_t) t0 * g.n_ff_dense, nullptr, 1.0f, Ly.ffn_up.type, E,
+                g.n_ff_dense};
+        for (auto& jj : j) cols(jj, n, (int64_t) W.xq_s, E, g.n_ff_dense);
+        if (!gf::mv(j, 2, s)) { err = "glm window: dense ffn"; return false; }
+        for (int t = t0; t < t0 + n; ++t)
+            gf::swiglu_q8(W.dg + (size_t) t * g.n_ff_dense, W.du + (size_t) t * g.n_ff_dense, g.swiglu_shexp,
+                          g.n_ff_dense, (uint8_t*) W.dhq + (size_t) t * W.dhq_s, s);
+        gf::MvJob dn = {Ly.ffn_down.q, (const uint8_t*) W.dhq + (size_t) t0 * W.dhq_s, nullptr, W.ffn + (size_t) t0 * E,
+                        nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense, E};
+        cols(dn, n, (int64_t) W.dhq_s, 0, E);
+        if (!gf::mv(&dn, 1, s)) { err = "glm window: dense ffn down"; return false; }
+        mark("dense_ffn");
+        return true;
+    };
+    if (g.dsa) {
+        // glm-dsa: the plain residual (one stream) in W.R[0]; a layer's attention row by row through fast_dsa_rope -
+        // the token path's arithmetic, KV streaming included, each row's selection its own W.cells row across the
+        // shared indexer layers - then the FFN of all the rows at once (fast_moe_window: one fetch of an expert for
+        // every row that routes to it).  Row t reads the cache rows t - 1 .. 0 wrote at the same layer.
+        struct Restore {
+            FastState* f;
+            float *x, *mixer;
+            void* xq;
+            int* cells;
+            int n_sel;
+            ~Restore() { f->x = x; f->mixer = mixer; f->xq = xq; f->cells = cells; f->dsa_n_sel = n_sel; }
+        } restore{F, F->x, F->mixer, F->xq, F->cells, F->dsa_n_sel};
+        float* R = W.R[0];
+        const int NS = g.n_sel_max();
+        static const bool wtrace = getenv("STRATA_GLM_WIN_TRACE") != nullptr;   // (debug: sync + print each step)
+        const auto step = [&](const char* what, int il, int t) {
+            if (!wtrace) return;
+            const cudaError_t e = cudaStreamSynchronize(s);
+            std::fprintf(stderr, "glm win trace: CUDA%d %s layer %d row %d p0 %lld T %d: %s\n", dev_, what, il, t,
+                         (long long) p0, T, cudaGetErrorString(e));
+        };
+        step("begin", l0_, -1);
+        for (int il = l0_; il < l1_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            for (int t = 0; t < T; ++t) {
+                float* Rt = R + (size_t) t * E;
+                float* xt = W.x + (size_t) t * E;
+                void* xqt = (uint8_t*) W.xq + (size_t) t * W.xq_s;
+                gf::rms_q8(Rt, il == l0_ ? nullptr : W.ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps, E, xt, xqt, s);
+                F->x = xt;
+                F->xq = xqt;
+                F->mixer = W.mixer + (size_t) t * E;
+                F->cells = W.cells + (size_t) t * NS;
+                F->dsa_n_sel = (int) std::min<int64_t>(g.idx_top_k, p0 + t + 1);
+                if (!fast_dsa_rope(il, p0 + t, err)) return false;
+                step("attn", il, t);
+                gf::rms_q8(Rt, W.mixer + (size_t) t * E, Ly.ffn_norm, g.norm_eps, E, xt, xqt, s);
+            }
+            mark("dsa");
+            if (!(Ly.moe ? fast_moe_window(il, 0, T, 0, 0, err) : dense_ffn(il, 0, T))) return false;
+            step(Ly.moe ? "moe" : "dense", il, -1);
+        }
+        for (int t = 0; t < T; ++t)   // the last layer's write: R += ffn (gf::rms_q8's add, its norm output unused)
+            gf::rms_q8(R + (size_t) t * E, W.ffn + (size_t) t * E, F->L[(size_t) (l1_ - 1)].ffn_norm, g.norm_eps, E,
+                       W.x + (size_t) t * E, (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
+        W.out = 0;
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            err = std::string("glm window: ") + cudaGetErrorString(e);
+            return false;
+        }
+        return true;
+    }
     // a layer's first half for tokens t0 .. t0 + n - 1: the attention side, the FFN-side read, and the FFN up to its
     // routes (moe part 1) - or all of it (moe part 0 / a dense FFN).  The second half (moe part 2): the experts and the
     // CPU lane's answers.

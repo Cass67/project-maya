@@ -962,9 +962,14 @@ bool Glm5Model::fast_setup(std::string& err) {
     size_t win_free0 = 0, win_total = 0;
     cudaMemGetInfo(&win_free0, &win_total);
     if (dflash_on_ && !win_reserve(err)) return false;
+    // glm-dsa's MTP decode across a split (STRATA_GLM_SPLIT_MTP=1): every part's verify window - the tail's NextN cache
+    // rows and draft head below, as one GPU's
+    const bool split_mtp = g_.dsa && n_parts_ > 1 && !dflash_on_ && split_mtp_wanted();
+    if (split_mtp && !win_reserve(err)) return false;
     // the one-GPU MTP decode (glm_mtp.cu; load_pack loaded the NextN block for it): the same window, the NextN cache
     // fill's rows, the draft head and the chain's token_embd - before the pool too; without them, token by token
-    if (mtp_il_ >= 0 && split_next_ == nullptr && l0_ == 0 && !dflash_on_ && mtp_decode_wanted(dev_, n_parts_)) {
+    if (mtp_il_ >= 0 && split_next_ == nullptr && (l0_ == 0 || split_mtp) && !dflash_on_ &&
+        (split_mtp || mtp_decode_wanted(dev_, n_parts_))) {
         std::string werr;
         if (win_reserve(werr) && mtp_cache_setup(werr)) {
             mtp_dec_ = true;
