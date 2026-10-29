@@ -1738,7 +1738,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             err = "glm fast: the table update buffers did not allocate";
             return false;
         }
-        F->stage.assign((size_t) g.n_exp_used, nullptr);
+        // a route's experts, and at least the warm-up's batch of 8 (fast_warm streams 8 at a time through stage[0..7])
+        F->stage.assign((size_t) std::max(g.n_exp_used, 8), nullptr);
         for (auto& sbuf : F->stage)
             if (cudaHostAlloc((void**) &sbuf, sstride, cudaHostAllocPortable) != cudaSuccess) {
                 err = "glm fast: pinned disk staging did not allocate";
@@ -2572,7 +2573,10 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
 #ifdef STRATA_NATIVE_EXPERTS
     const uint8_t* plane[8] = {};
     const size_t plane_row = kc::iq2_plane_row_bytes(n_embd);
-    if (ne <= 8 && plane_row && F->cpu_iq2_planes_n > 0 && F->cpu_iq2_planes_enabled.load(std::memory_order_relaxed)) {
+    // (the lane queues its missing experts even with the cache switched off: lazy planes then build during a native
+    //  pass, and the switch only chooses the kernel)
+    if (ne <= 8 && plane_row && F->cpu_iq2_planes_n > 0) {
+        const bool use = F->cpu_iq2_planes_enabled.load(std::memory_order_relaxed);
         const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
         int miss[8], n_miss = 0;
         if (R.per_part == 0) for (int i = 0; i < ne; ++i) {
@@ -2580,8 +2584,9 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
             if (p < b || p - b >= (size_t) R.n * R.stride || (p - b) % R.stride) continue;
             const int key = R.key[(p - b) / R.stride];
             if (key < 0 || (size_t) key >= F->cpu_iq2_planes_n) continue;
-            plane[i] = F->cpu_iq2_planes[(size_t) key].load(std::memory_order_acquire);
-            if (plane[i] == nullptr) miss[n_miss++] = key;
+            uint8_t* pp = F->cpu_iq2_planes[(size_t) key].load(std::memory_order_acquire);
+            if (pp == nullptr) miss[n_miss++] = key;
+            else if (use) plane[i] = pp;
         }
         if (n_miss > 0 && !F->pl_full.load(std::memory_order_relaxed)) {
             bool any = false;
@@ -3340,7 +3345,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         };
         const char* gb = getenv("STRATA_GLM_CPU_PLANES_GB");
         if (gb != nullptr && std::atof(gb) > 0.0) {
-            F->pl_budget = (size_t) (std::atof(gb) * 1073741824.0);
+            F->pl_budget = (size_t) (std::atof(gb) * 1073741824.0 / std::max(1, n_parts_));   // the n GiB are the split's total
             F->pl_queued.assign(F->cpu_iq2_planes_n, 0);
             F->pl_full.store(false);
             std::fprintf(stderr, "glm CPU planes: CUDA%d mode=%d lazy, up to %.1f GiB for the experts the lane computes\n",
