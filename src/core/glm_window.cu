@@ -914,6 +914,7 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
                 float* xt = W.x + (size_t) t * E;
                 void* xqt = (uint8_t*) W.xq + (size_t) t * W.xq_s;
                 gf::rms_q8(Rt, il == l0_ ? nullptr : W.ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps, E, xt, xqt, s);
+                dflash_capture(il, Rt, 1, p0 + t, F->cap, F->cap_rows, s);
                 F->x = xt;
                 F->xq = xqt;
                 F->mixer = W.mixer + (size_t) t * E;

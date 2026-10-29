@@ -5775,6 +5775,7 @@ bool Glm5Model::fast_layers_dsa(int64_t p, std::string& err) {
             gf::skip_gate(F->win.from, F->win.pipe_t, F->win.skip_d, s);
         if (F->spec_gate) gf::skip_gate(F->spec_live_h, 0, F->spec_skip_d, s);
         gf::rms_q8(state_, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        dflash_capture(il, state_, 1, p, F->cap, F->cap_rows, s);   // (the residual entering the layer: a drafter's feature)
         if (dumps) {
             if (il != l0_) fast_dump(s, "l_out-" + std::to_string(il - 1), state_, g.n_embd);
             fast_dump(s, "attn_norm-" + std::to_string(il), F->x, g.n_embd);
