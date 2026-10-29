@@ -93,7 +93,27 @@ bool Glm5Model::mtp_decode_wanted(int dev, int n_parts) {
 #endif
 }
 
-bool Glm5Model::mtp_ready() const { return fast_ != nullptr && mtp_dec_ && mtp_il_ >= 0 && split_next_ == nullptr; }
+// glm-dsa on a split (STRATA_GLM_SPLIT_MTP=1): the tail part (the NextN block, the head) drafts, the window spans the
+// parts; off by default until it is the faster decode
+bool Glm5Model::split_mtp_wanted() {
+    static const bool v = [] {
+        const char* e = getenv("STRATA_GLM_SPLIT_MTP");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+}
+
+// the part whose NextN block drafts: this one on one GPU, a glm-dsa split's last part
+const Glm5Model* Glm5Model::mtp_owner() const {
+    const Glm5Model* t = this;
+    while (t->split_next_) t = t->split_next_.get();
+    return t == this || g_.dsa ? t : nullptr;
+}
+
+bool Glm5Model::mtp_ready() const {
+    const Glm5Model* M = mtp_owner();
+    return fast_ != nullptr && M != nullptr && M->fast_ != nullptr && M->mtp_dec_ && M->mtp_il_ >= 0;
+}
 
 // ---------------------------------------------------------------- the draft head
 // A draft step ran the whole output head - 154880 x 4096 Q6_K, 0.52 GB, ~2.4 ms of the ~4 ms a step on the Radeon 8065S
@@ -381,6 +401,11 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
         else tt->to_float(pack_emb_src_ + (size_t) next[i] * row_b, row, g.n_embd);
     }
     cudaMemcpyAsync(C.emb, emb_h, (size_t) n * E * sizeof(float), cudaMemcpyHostToDevice, s);
+    if (g.dsa) {   // glm-dsa's block: the token path's entry fill (roped k_pe, the [latent | k_pe] record), entry by entry
+        for (int i = 0; i < n; ++i)
+            if (!fast_mtp_cache_rope(p0 + i, h + (size_t) i * E, C.emb + (size_t) i * E, err)) return false;
+        return true;
+    }
     for (int i = 0; i < n; ++i)
         gf::mtp_in(C.emb + (size_t) i * E, h + (size_t) i * E, Ly.enorm, Ly.hnorm, g.norm_eps, g.n_embd,
                    (uint8_t*) C.catq + (size_t) i * q8_bytes(2 * E), s);
@@ -545,10 +570,24 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
         return false;
     }
     FastState* F = fast_;
+    // the drafting part (this one on one GPU; a glm-dsa split's last part): its NextN block, draft head, head_x and the
+    // window's head rows; the sampler, the window and the commit span the parts from here
+    Glm5Model* M = mtp_owner();
+    FastState* FM = M->fast_;
     const Glm5Geometry& g = g_;
     const int64_t E = g.n_embd;
     const int n_cap = std::min(mtp_draft_cap(), std::min(kWinMax - 1, 8));
     static const bool trace = getenv("STRATA_GLM_MTP_TRACE") != nullptr;
+    static const bool wtrace = getenv("STRATA_GLM_WIN_TRACE") != nullptr;
+    const auto wstep = [&](const char* what) {
+        if (!wtrace) return;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            const cudaError_t e = cudaStreamSynchronize(m->fast_->cs);
+            std::fprintf(stderr, "glm mtp trace: %s CUDA%d: %s\n", what, m->dev_, cudaGetErrorString(e));
+        }
+        cudaSetDevice(dev_);
+    };
     // the first token: the prompt's last forward left its logits (and greedy argmax)
     int y = -1;
     if (sp.greedy && sp.penalty_last_n <= 0 && last_tok_ >= 0) {   // (penalties: picked through the sampler)
@@ -581,11 +620,12 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
         return w > 0 ? 1.0 - 1.0 / (double) w : 1.0;
     }();
     int64_t n_out = 0, n_full = 0, n_drafting = 0;
-    const bool chain = F->mtp_emb != nullptr && mtp_chain_wanted();
+    const bool chain = FM->mtp_emb != nullptr && mtp_chain_wanted();
     const auto note = [&](int tok) {
-        const bool outside = !mtp_vin_.empty() && tok >= 0 && tok < (int) mtp_vin_.size() && !mtp_vin_[(size_t) tok];
+        const auto& vin = M->mtp_vin_;
+        const bool outside = !vin.empty() && tok >= 0 && tok < (int) vin.size() && !vin[(size_t) tok];
         n_out += outside ? 1 : 0;
-        mtp_out_ += ((outside ? 1.0 : 0.0) - mtp_out_) / 64.0;
+        M->mtp_out_ += ((outside ? 1.0 : 0.0) - M->mtp_out_) / 64.0;
     };
     note(y);
     // the drafting rounds' host time: drafts, verify (to the tokens), accept + commit + cache
@@ -599,7 +639,7 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
         int n = mtp_choose(n_cap);
         n = (int) std::min<int64_t>(n, max_new - produced - 1);
         n = (int) std::min<int64_t>(n, max_ctx_ - 1 - p0);
-        if (mtp_hx_pos_ != p0 - 1) n = 0;   // (no trunk state to draft from: a plain token)
+        if (M->mtp_hx_pos_ != p0 - 1) n = 0;   // (no trunk state to draft from: a plain token)
         n = std::max(n, 0);
         win[0] = y;
         int nd = 0;
@@ -607,43 +647,45 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             // ---- 1. the drafts: the NextN block at p0 - 1 + i on (its last hidden state, the last token)
             // (the chain queues them behind the last round's commit and cache rows: nothing of the host's they read
             // is still in flight)
-            cudaSetDevice(dev_);
-            if ((!chain && !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm mtp draft sync", err)) ||
-                !F->route_ok(err)) {
+            cudaSetDevice(M->dev_);
+            if ((!chain && !glmfast::cuda_ok(cudaStreamSynchronize(FM->cs), "glm mtp draft sync", err)) ||
+                !FM->route_ok(err)) {
                 ok = false;
                 break;
             }
             // the draft vocabulary while the answer stays in it, the whole head while it does not (mtp_out_)
-            const bool sub = F->mtp_dv > 0 && mtp_out_ < kOutMax;
+            const bool sub = FM->mtp_dv > 0 && M->mtp_out_ < kOutMax;
             if (chain) {
                 // the chain: every step queued at once, each step's argmax the next one's token on the device; the
                 // host reads the n drafts back once
-                for (int i = 0; i < n && ok; ++i) ok = fast_mtp(p0 - 1 + i, i == 0 ? y : -1, err, i, sub, false);
+                for (int i = 0; i < n && ok; ++i) ok = M->fast_mtp(p0 - 1 + i, i == 0 ? y : -1, err, i, sub, false);
                 if (ok) {
-                    cudaMemcpyAsync(F->mtp_tok_h, F->mtp_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, F->cs);
-                    cudaEventRecord(F->ev_mtp, F->cs);
-                    ok = glmfast::wait_event(F->ev_mtp, "glm mtp drafts", err) && F->route_ok(err);
+                    cudaMemcpyAsync(FM->mtp_tok_h, FM->mtp_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, FM->cs);
+                    cudaEventRecord(FM->ev_mtp, FM->cs);
+                    ok = glmfast::wait_event(FM->ev_mtp, "glm mtp drafts", err) && FM->route_ok(err);
                 }
-                for (int i = 0; i < n && ok; ++i) win[(size_t) i + 1] = F->mtp_tok_h[i];
+                for (int i = 0; i < n && ok; ++i) win[(size_t) i + 1] = FM->mtp_tok_h[i];
                 if (ok) nd = n;
             } else {
                 int32_t tok = y;
                 for (int i = 0; i < n; ++i) {
-                    if (!fast_mtp(p0 - 1 + i, tok, err, i, sub) ||
-                        !glmfast::wait_event(F->ev_mtp, "glm mtp draft", err) || !F->route_ok(err)) {
+                    if (!M->fast_mtp(p0 - 1 + i, tok, err, i, sub) ||
+                        !glmfast::wait_event(FM->ev_mtp, "glm mtp draft", err) || !FM->route_ok(err)) {
                         ok = false;
                         break;
                     }
-                    tok = F->mtp_tok_h[i];
+                    tok = FM->mtp_tok_h[i];
                     win[(size_t) i + 1] = tok;
                     ++nd;
                 }
             }
             n_full += sub ? 0 : 1;
             ++n_drafting;
-            mtp_hx_pos_ = -1;   // (head_x holds the block's hidden state now)
+            M->mtp_hx_pos_ = -1;   // (head_x holds the block's hidden state now)
+            cudaSetDevice(dev_);
             if (!ok) break;
         }
+        wstep("drafts");
         const int T = 1 + nd;
         int keep = 1, acc = 0;
         bool more = true;
@@ -677,6 +719,7 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
                 ok = false;
                 break;
             }
+            wstep("window");
             const auto t2 = std::chrono::steady_clock::now();
             ph[0] += std::chrono::duration<double, std::milli>(t1 - t0).count();
             ph[1] += std::chrono::duration<double, std::milli>(t2 - t1).count();
@@ -703,17 +746,21 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
                 ok = false;
                 break;
             }
+            wstep("commit");
             // ---- 5. the NextN cache: entries p0 .. p0 + keep - 2 from the kept rows' trunk states and the accepted
             //         drafts; entry p0 + keep - 1 is the next round's first draft step (or the token path's)
-            const float* rows_hx = F->win.head_x;
-            if (keep > 1 && !mtp_cache_rows(p0, keep - 1, rows_hx, win.data() + 1, err, !chain)) {
+            const float* rows_hx = FM->win.head_x;
+            cudaSetDevice(M->dev_);
+            if (keep > 1 && !M->mtp_cache_rows(p0, keep - 1, rows_hx, win.data() + 1, err, !chain)) {
                 ok = false;
                 break;
             }
+            cudaSetDevice(M->dev_);
+            cudaMemcpyAsync(FM->head_x, rows_hx + (size_t) (keep - 1) * E, (size_t) E * sizeof(float),
+                            cudaMemcpyDeviceToDevice, FM->cs);
+            M->mtp_hx_pos_ = p0 + keep - 1;
             cudaSetDevice(dev_);
-            cudaMemcpyAsync(F->head_x, rows_hx + (size_t) (keep - 1) * E, (size_t) E * sizeof(float),
-                            cudaMemcpyDeviceToDevice, F->cs);
-            mtp_hx_pos_ = p0 + keep - 1;
+            wstep("cache");
             ph[2] += ms_since(t2);
             ++n_ph;
         }
@@ -743,20 +790,24 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
     }
     // drain: the device idle, the routes checked
     {
-        cudaSetDevice(dev_);
         std::string drain_err;
-        if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm mtp drain", drain_err) || !F->route_ok(drain_err)) {
-            if (ok) err = drain_err;
-            ok = false;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm mtp drain", drain_err) ||
+                !m->fast_->route_ok(drain_err)) {
+                if (ok) err = drain_err;
+                ok = false;
+            }
         }
+        cudaSetDevice(dev_);
     }
     win_prof_report();   // (STRATA_GLM_WIN_PROF: the verify windows' phases)
     if (n_ph > 0)
         std::fprintf(stderr, "glm mtp: a drafting round's host time - drafts %.2f ms, verify %.2f ms, commit + cache "
                              "%.2f ms (%lld rounds)\n", ph[0] / n_ph, ph[1] / n_ph, ph[2] / n_ph, (long long) n_ph);
-    if (F->mtp_dv > 0 && produced > 0)
+    if (FM->mtp_dv > 0 && produced > 0)
         std::fprintf(stderr, "glm mtp: the draft vocabulary (%d + %d tokens) - %lld of %lld emitted tokens outside it, "
-                             "%lld of %lld drafting rounds on the whole head\n", F->mtp_dv, F->mtp_dx,
+                             "%lld of %lld drafting rounds on the whole head\n", FM->mtp_dv, FM->mtp_dx,
                      (long long) n_out, (long long) produced, (long long) n_full, (long long) n_drafting);
     if (ok && gf::launch_errors() > 0) {
         err = "glm mtp: a kernel launch failed (see stderr)";
