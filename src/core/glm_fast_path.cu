@@ -72,6 +72,7 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/resource.h>
 #endif
 
 namespace gf = strata::kernels::glmf;
@@ -2571,13 +2572,29 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
 #ifdef STRATA_NATIVE_EXPERTS
     const uint8_t* plane[8] = {};
     const size_t plane_row = kc::iq2_plane_row_bytes(n_embd);
-    if (ne <= 8 && plane_row && !F->cpu_iq2_planes.empty() && F->cpu_iq2_planes_enabled.load(std::memory_order_relaxed)) {
+    if (ne <= 8 && plane_row && F->cpu_iq2_planes_n > 0 && F->cpu_iq2_planes_enabled.load(std::memory_order_relaxed)) {
         const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+        int miss[8], n_miss = 0;
         if (R.per_part == 0) for (int i = 0; i < ne; ++i) {
             const uintptr_t p = reinterpret_cast<uintptr_t>(blob[i]), b = reinterpret_cast<uintptr_t>(R.base);
             if (p < b || p - b >= (size_t) R.n * R.stride || (p - b) % R.stride) continue;
             const int key = R.key[(p - b) / R.stride];
-            if (key >= 0 && (size_t) key < F->cpu_iq2_planes.size()) plane[i] = F->cpu_iq2_planes[(size_t) key].get();
+            if (key < 0 || (size_t) key >= F->cpu_iq2_planes_n) continue;
+            plane[i] = F->cpu_iq2_planes[(size_t) key].load(std::memory_order_acquire);
+            if (plane[i] == nullptr) miss[n_miss++] = key;
+        }
+        if (n_miss > 0 && !F->pl_full.load(std::memory_order_relaxed)) {
+            bool any = false;
+            {
+                std::lock_guard<std::mutex> lk(F->pl_mu);
+                for (int m = 0; m < n_miss; ++m)
+                    if (!F->pl_queued[(size_t) miss[m]]) {
+                        F->pl_queued[(size_t) miss[m]] = 1;
+                        F->pl_q.push_back(miss[m]);
+                        any = true;
+                    }
+            }
+            if (any) F->pl_cv.notify_one();
         }
     }
 #endif
@@ -3267,8 +3284,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         F->cpu_node = pin_node;
         F->cpu_pin = pin_cpus;
     }
-    // Experimental lossless CPU planes. Snapshot held experts by immutable key before services start; newly demoted
-    // uncached experts use the native path. GPU transfers and prefill continue to consume the original GGUF bytes.
+    // Experimental lossless CPU planes, keyed by expert (immutable content); uncached experts use the native path.
+    // GPU transfers and prefill keep consuming the original GGUF bytes.  STRATA_GLM_CPU_PLANES=1|2 alone: every
+    // RAM-held expert packed here, before the services start.  With STRATA_GLM_CPU_PLANES_GB=<n>: none here - a
+    // background thread packs the experts the lane computes (the hottest first, as they come first), until n GiB.
 #if defined(__linux__) && defined(STRATA_NATIVE_EXPERTS)
     if (const char* cp = getenv("STRATA_GLM_CPU_PLANES"); cp && std::atoi(cp) != 0 &&
         kc::iq2_plane_available() && g.n_embd == 6144 && g.n_ff_exp == 2048) {
@@ -3276,46 +3295,136 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         const size_t one = row * (size_t) g.n_ff_exp;
         const size_t down_row = kc::iq3_nibble_row_bytes((int) g.n_ff_exp);
         F->cpu_iq2_plane_mode = std::atoi(cp) >= 2 ? 2 : 1;
-        F->cpu_iq2_planes.resize(F->ram_of.size());
-        size_t packed = 0, allocated = 0;
-        const auto begin = std::chrono::steady_clock::now();
-        for (auto& R : F->rc) for (int s = 0; s < R.n; ++s) {
-            const int key = R.key[(size_t) s], il = key >= 0 ? key / g.n_expert : -1;
-            if (key < 0 || (size_t) key >= F->cpu_iq2_planes.size() || il < l0_ || il >= lt_ ||
-                R.st[(size_t) s] != FastState::kRHold || F->cpu_fmt[(size_t) il].gu_type != 17) continue;
+        F->cpu_iq2_planes_n = F->ram_of.size();
+        F->cpu_iq2_planes.reset(new std::atomic<uint8_t*>[F->cpu_iq2_planes_n]);
+        for (size_t k = 0; k < F->cpu_iq2_planes_n; ++k) F->cpu_iq2_planes[k].store(nullptr);
+        // one expert's planes from its GGUF bytes, the repack split over `jobs` calls of run: 1 built, 0 not a planes
+        // layer (or this half's), -1 no memory
+        using Run = std::function<void(int, const std::function<void(int)>&)>;
+        const auto build = [this, row, one, down_row](int key, const uint8_t* raw, int jobs, const Run& run,
+                                                      uint8_t*& out, size_t& bytes) -> int {
+            FastState* F = fast_;
+            const Glm5Geometry& g = g_;
+            const int il = key / g.n_expert;
+            if (il < l0_ || il >= lt_ || F->cpu_fmt[(size_t) il].gu_type != 17) return 0;
             const auto& layer = F->L[(size_t) il];
             const auto& fmt = F->cpu_fmt[(size_t) il];
             const bool pack_down = F->cpu_iq2_plane_mode >= 2 && fmt.d_type == 18;
-            const size_t bytes = 2 * one + (pack_down ? down_row * (size_t) g.n_embd : 0);
+            bytes = 2 * one + (pack_down ? down_row * (size_t) g.n_embd : 0);
             auto* p = (uint8_t*) mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (p == MAP_FAILED) break;
+            if (p == MAP_FAILED) return -1;
             unsigned long mask[4] = {};
             for (int node : numa_nodes()) if (node >= 0 && node < 256) mask[node / 64] |= 1ul << (node % 64);
             if (mask[0] || mask[1] || mask[2] || mask[3])
                 if (syscall(SYS_mbind, p, bytes, 3 /* MPOL_INTERLEAVE */, mask, 256, 0u) != 0) {
-                    munmap(p, bytes); break;
+                    munmap(p, bytes);
+                    return -1;
                 }
             madvise(p, bytes, MADV_NOHUGEPAGE);
-            const uint8_t* raw = R.slot((size_t) s);
-            F->cpu_pool->run(threads, [&](int job) {
-                const int r0 = (int) (g.n_ff_exp * job / threads), r1 = (int) (g.n_ff_exp * (job + 1) / threads);
+            run(jobs, [&](int job) {
+                const int r0 = (int) (g.n_ff_exp * job / jobs), r1 = (int) (g.n_ff_exp * (job + 1) / jobs);
                 kc::iq2_plane_repack(raw + fmt.gu_row * r0, p + row * r0, r1 - r0);
                 kc::iq2_plane_repack(raw + layer.gu_bytes + fmt.gu_row * r0, p + one + row * r0, r1 - r0);
                 if (pack_down) {
-                    const int d0 = (int) (g.n_embd * job / threads), d1 = (int) (g.n_embd * (job + 1) / threads);
+                    const int d0 = (int) (g.n_embd * job / jobs), d1 = (int) (g.n_embd * (job + 1) / jobs);
                     kc::iq3_nibble_repack(raw + layer.down_off + fmt.d_row * d0, p + 2 * one + down_row * d0,
                                           d1 - d0, (int) g.n_ff_exp);
                 }
             });
-            F->cpu_iq2_planes[(size_t) key] = std::shared_ptr<uint8_t>(p, [bytes](uint8_t* q) { munmap(q, bytes); });
-            allocated += bytes;
-            if (++packed % 512 == 0)
-                std::fprintf(stderr, "glm CPU planes: CUDA%d %zu experts, %.2f GiB, %.1f s\n", dev_, packed,
-                    allocated / 1073741824.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+            out = p;
+            return 1;
+        };
+        const auto publish = [F](int key, uint8_t* p, size_t bytes) {
+            F->cpu_iq2_own.emplace_back(p, [bytes](uint8_t* q) { munmap(q, bytes); });
+            F->cpu_iq2_planes[(size_t) key].store(p, std::memory_order_release);
+        };
+        const char* gb = getenv("STRATA_GLM_CPU_PLANES_GB");
+        if (gb != nullptr && std::atof(gb) > 0.0) {
+            F->pl_budget = (size_t) (std::atof(gb) * 1073741824.0);
+            F->pl_queued.assign(F->cpu_iq2_planes_n, 0);
+            F->pl_full.store(false);
+            std::fprintf(stderr, "glm CPU planes: CUDA%d mode=%d lazy, up to %.1f GiB for the experts the lane computes\n",
+                         dev_, F->cpu_iq2_plane_mode, F->pl_budget / 1073741824.0);
+            F->pl_th = std::thread([this, build, publish] {
+                FastState* F = fast_;
+                setpriority(PRIO_PROCESS, (id_t) syscall(SYS_gettid), 10);   // below the lane's threads
+                const Run serial = [](int jobs, const std::function<void(int)>& fn) {
+                    for (int j = 0; j < jobs; ++j) fn(j);
+                };
+                size_t built = 0;
+                for (;;) {
+                    int key;
+                    {
+                        std::unique_lock<std::mutex> lk(F->pl_mu);
+                        F->pl_cv.wait(lk, [&] { return F->pl_quit || !F->pl_q.empty(); });
+                        if (F->pl_quit) return;
+                        key = F->pl_q.front();
+                        F->pl_q.erase(F->pl_q.begin());
+                    }
+                    const auto& R = F->rc[(size_t) F->layer_rc[(size_t) (key / g_.n_expert)]];
+                    // the expert's RAM slot, held (landed, not being replaced): read it only then, and keep the
+                    // planes only if the same slot still holds it afterwards
+                    const auto held = [&] {
+                        std::lock_guard<std::mutex> lk(F->mu);
+                        const int s = F->ram_of[(size_t) key];
+                        return s >= 0 && R.st[(size_t) s] == FastState::kRHold && R.key[(size_t) s] == key ? s : -1;
+                    };
+                    const int s0 = held();
+                    uint8_t* p = nullptr;
+                    size_t bytes = 0;
+                    const int r = s0 >= 0 ? build(key, R.slot((size_t) s0), 1, serial, p, bytes) : 2;
+                    if (r == -1) {
+                        F->pl_full.store(true);
+                        std::fprintf(stderr, "glm CPU planes: CUDA%d out of memory after %zu experts\n", dev_, built);
+                        return;
+                    }
+                    if (r == 1 && held() != s0) {
+                        munmap(p, bytes);
+                        std::lock_guard<std::mutex> lk(F->pl_mu);
+                        F->pl_queued[(size_t) key] = 0;   // moved while being read: the next miss queues it again
+                        continue;
+                    }
+                    if (r == 2) {
+                        std::lock_guard<std::mutex> lk(F->pl_mu);
+                        F->pl_queued[(size_t) key] = 0;
+                        continue;
+                    }
+                    if (r == 0) continue;   // stays queued: never a planes expert
+                    publish(key, p, bytes);
+                    F->pl_used += bytes;
+                    if (++built % 256 == 0)
+                        std::fprintf(stderr, "glm CPU planes: CUDA%d %zu experts, %.2f GiB\n", dev_, built,
+                                     F->pl_used / 1073741824.0);
+                    if (F->pl_used + bytes > F->pl_budget) {
+                        F->pl_full.store(true);
+                        std::fprintf(stderr, "glm CPU planes: CUDA%d budget spent: %zu experts, %.2f GiB\n", dev_,
+                                     built, F->pl_used / 1073741824.0);
+                        return;
+                    }
+                }
+            });
+        } else {
+            const Run pool = [&](int jobs, const std::function<void(int)>& fn) { F->cpu_pool->run(jobs, fn); };
+            size_t packed = 0, allocated = 0;
+            const auto begin = std::chrono::steady_clock::now();
+            for (auto& R : F->rc) for (int s = 0; s < R.n; ++s) {
+                const int key = R.key[(size_t) s];
+                if (key < 0 || (size_t) key >= F->cpu_iq2_planes_n || R.st[(size_t) s] != FastState::kRHold) continue;
+                uint8_t* p = nullptr;
+                size_t bytes = 0;
+                const int r = build(key, R.slot((size_t) s), threads, pool, p, bytes);
+                if (r < 0) break;
+                if (r == 0) continue;
+                publish(key, p, bytes);
+                allocated += bytes;
+                if (++packed % 512 == 0)
+                    std::fprintf(stderr, "glm CPU planes: CUDA%d %zu experts, %.2f GiB, %.1f s\n", dev_, packed,
+                        allocated / 1073741824.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+            }
+            std::fprintf(stderr, "glm CPU planes: CUDA%d ready mode=%d, %zu experts, %.2f GiB, %.1f s; uncached experts use native\n",
+                dev_, F->cpu_iq2_plane_mode, packed, allocated / 1073741824.0,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
         }
-        std::fprintf(stderr, "glm CPU planes: CUDA%d ready mode=%d, %zu experts, %.2f GiB, %.1f s; uncached experts use native\n",
-            dev_, F->cpu_iq2_plane_mode, packed, allocated / 1073741824.0,
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     }
 #endif
     // one GPU with a DFlash drafter on two NUMA nodes or more: a verify window's tokens on both sockets (win_lane) - the
@@ -4026,6 +4135,12 @@ void Glm5Model::fast_destroy() {
     }
     F->ah_cv.notify_all();
     for (auto& t : F->ah_th) t.join();
+    {
+        std::lock_guard<std::mutex> lk(F->pl_mu);
+        F->pl_quit = true;
+    }
+    F->pl_cv.notify_all();
+    if (F->pl_th.joinable()) F->pl_th.join();
     F->workers.reset();
     win_lanes_stop();   // (after the service thread: it hands them their routes)
     F->cpu_pool.reset();
