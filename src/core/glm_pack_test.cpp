@@ -5,6 +5,7 @@
 // Teacher-forces token ids 1..n (streaming, one forward per token) through the pack-backed
 // runner and writes the (T, vocab) float32 logits.  The cross-check is llama.cpp on the same
 // GGUF (llm_logits_dump) - docs/GLM5-FLASH.md §9.
+#include "strata/platform/numa_balance.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -19,6 +20,7 @@
 #include <vector>
 
 int main(int argc, char** argv) {
+    strata::platform::numa_local_policy();   // (before any thread: out of the kernel's NUMA balancing)
     if (argc < 3) {
         std::fprintf(stderr, "usage: %s <pack_dir> <n_tokens> [out.bin]\n", argv[0]);
         return 2;
@@ -295,7 +297,19 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return true;
             };
-            if (model.dflash_ready()) {   // (STRATA_GLM_DFLASH: the drafter against the token path)
+            if (const char* lt = getenv("GLM_TEST_LANE_THREADS")) {   // "40,44,56": the MTP decode, every miss on the CPU
+                if (!bench("no-mtp", false, 0, -1)) return 1;
+                for (const char* q = lt; *q;) {
+                    const int th = std::atoi(q);
+                    const std::string nm = "lane-" + std::to_string(th);
+                    if (th > 0 && !bench(nm.c_str(), true, th, 0.0)) {
+                        std::fprintf(stderr, "decode comparison: %s\n", err.c_str());
+                        return 1;
+                    }
+                    while (*q && *q != ',') ++q;
+                    if (*q == ',') ++q;
+                }
+            } else if (model.dflash_ready()) {   // (STRATA_GLM_DFLASH: the drafter against the token path)
                 if (!bench("no-mtp", false, 0, -1) || !bench("dflash", true, 0, -1) || !bench("dflash-repeat", true, 0, -1)) {
                     std::fprintf(stderr, "decode comparison: %s\n", err.c_str());
                     return 1;
