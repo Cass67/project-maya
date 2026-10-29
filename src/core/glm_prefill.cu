@@ -2538,7 +2538,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 sgemm_bf16(Ly.idx_proj, g.idx_heads, E, xs, E, B.iw, g.idx_heads, tn,
                            1.0f / std::sqrt((float) (g.idx_key * g.idx_heads)));
             }
-            float* const kpe = state_ + dsa_kpe_[(size_t) il];
+            // a cell's [latent | k_pe] record: lat is the identity cache, or the layer's staging copy when it streams
+            float* const kpe = (float*) (lat + g.kv_lora);
             float* const ik = state_ + dsa_pool_[(size_t) il];
             gf::DsaRopePrepArgs d;
             d.qr_raw = B.qr_raw;
@@ -2562,6 +2563,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             d.base = g.rope_base;
             d.eps = g.norm_eps;
             d.ln_eps = g.idx_ln_eps;
+            d.rec = dsa_rec_;
+            if (kv_host != nullptr) {   // + the host copy and the resident slots (the stage is this chunk's only)
+                d.lat_host = (uint16_t*) kv_host;
+                d.lat_slots = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+                d.lat_table = kv_->map[(size_t) il].page_table;
+                d.lat_page = kv_->page;
+            }
             gf::dsa_rope_prep(d, s);
             hgemm_q(Ly.q_b, HQ, g.q_lora, B.qr16, g.q_lora, B.q, HQ, tn, 0.0f);
             gf::rope_heads(B.q + g.qk_nope, g.n_rot, g.k_mla(), g.n_head, pt, g.rope_base, s, tn, HQ);
@@ -2590,7 +2598,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
 #if defined(STRATA_USE_HIP)
             gb::mla_attn_wmma2(B.q_abs, lat, cells, B.n_sel, KS, g.n_head, g.kv_lora,
                                1.0f / std::sqrt((float) (g.qk_nope + g.n_rot)), tn, B.ctx, s, false, B.q + g.qk_nope,
-                               g.k_mla(), kpe, g.n_rot);
+                               g.k_mla(), kpe, g.n_rot, dsa_rec_, dsa_rec_ / 2);
 #else
             err = "glm prefill: the glm-dsa prompt attention is HIP only";
             return false;

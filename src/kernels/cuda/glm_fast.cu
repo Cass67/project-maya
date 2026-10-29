@@ -3282,9 +3282,14 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
 // The latents stay FP16 in shared memory, as in the cache (34 KB at kv_lora 512; F32 rows were over Turing's 64 KB).
 constexpr int MLA_CHUNK = 32;
 constexpr int MLA_HPB = 16;
+// (glm-dsa, mla_pe: lat_ld > 0 a cell's latent stride; q_pe non-null adds q_pe[h] . kpe[cell] (n_rot, q heads q_pe_hs
+//  apart, k_pe kpe_ld floats a cell) to each score; scale_ov > 0 the softmax scale; cells null: cell = position)
 __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                         const int* __restrict__ cells, int n_sel, int n_head, int qk_nope,
-                                                        int kv_lora, float* __restrict__ part, bool q8) {
+                                                        int kv_lora, float* __restrict__ part, bool q8, int lat_ld = 0,
+                                                        const float* __restrict__ q_pe = nullptr, int q_pe_hs = 0,
+                                                        const float* __restrict__ kpe = nullptr, int kpe_ld = 0,
+                                                        int n_rot = 0, float scale_ov = 0.0f) {
     extern __shared__ float smem[];
     uint16_t* sL = (uint16_t*) smem;                   // MLA_CHUNK x kv_lora, FP16
     float* sS = smem + MLA_CHUNK * kv_lora / 2;        // MLA_HPB x MLA_CHUNK scores -> weights
@@ -3293,15 +3298,16 @@ __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict_
     const int h0 = blockIdx.y * MLA_HPB, nh = min(MLA_HPB, n_head - h0);
     const int s0 = b * MLA_CHUNK;
     const int ns = min(MLA_CHUNK, n_sel - s0);
-    if (tid < MLA_CHUNK) s_cell[tid] = tid < ns ? cells[s0 + tid] : -1;
+    if (tid < MLA_CHUNK) s_cell[tid] = tid < ns ? (cells != nullptr ? cells[s0 + tid] : s0 + tid) : -1;
     __syncthreads();
+    const int ld = lat_ld > 0 ? lat_ld : kv_lora;
     for (int i = tid; i < MLA_CHUNK * kv_lora; i += blockDim.x) {
         const int s = i / kv_lora, c = i - s * kv_lora;
         const int cell = s_cell[s];
-        sL[i] = cell < 0 ? (uint16_t) 0 : q8 ? lat_h(lat_any(lat, true, kv_lora, cell, c)) : lat[(size_t) kv_lora * cell + c];
+        sL[i] = cell < 0 ? (uint16_t) 0 : q8 ? lat_h(lat_any(lat, true, kv_lora, cell, c)) : lat[(size_t) ld * cell + c];
     }
     __syncthreads();
-    const float scale = rsqrtf((float) qk_nope);
+    const float scale = scale_ov > 0.0f ? scale_ov : rsqrtf((float) qk_nope);
     // scores: a warp per head, the head's q in registers (kv_lora / 32 per lane), one warp reduction per cell
     for (int hh = warp; hh < nh; hh += nw) {
         float q[16];
@@ -3313,6 +3319,11 @@ __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict_
 #pragma unroll
             for (int j = 0; j < 16; ++j)
                 if (lane + 32 * j < kv_lora) acc += q[j] * lat_f(sL[s * kv_lora + lane + 32 * j]);
+            if (q_pe != nullptr && s_cell[s] >= 0) {
+                const float* qp = q_pe + (size_t) q_pe_hs * (h0 + hh);
+                const float* kr = kpe + (size_t) kpe_ld * s_cell[s];
+                for (int e = lane; e < n_rot; e += 32) acc += qp[e] * kr[e];
+            }
             acc = warp_sum(acc);
             if (lane == 0) sS[hh * MLA_CHUNK + s] = s_cell[s] >= 0 ? acc * scale : -INFINITY;
         }
@@ -7046,6 +7057,30 @@ __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) 
         float ss = 0.0f;
         for (int e = tid; e < a.kv_lora; e += blockDim.x) ss += a.kv_raw[e] * a.kv_raw[e];
         const float inv = rsqrtf(block_sum(ss, sred) / (float) a.kv_lora + a.eps);
+        if (a.rec > 0) {   // one record a position, into each target (identity / host copy / resident slot)
+            uint16_t* tg[3];
+            int nt = 0;
+            if (a.lat != nullptr) tg[nt++] = a.lat + (size_t) a.p * a.rec;
+            if (a.lat_host != nullptr) tg[nt++] = a.lat_host + (size_t) a.p * a.rec;
+            if (a.lat_slots != nullptr && a.lat_table != nullptr) {
+                const int sl = a.lat_table[a.p / a.lat_page];
+                if (sl >= 0) tg[nt++] = a.lat_slots + ((size_t) sl * a.lat_page + a.p % a.lat_page) * a.rec;
+            }
+            for (int e = tid; e < a.kv_lora; e += blockDim.x) {
+                const uint16_t h = __half_as_ushort(__float2half(a.kv_raw[e] * inv * a.kv_norm[e]));
+                for (int k = 0; k < nt; ++k) tg[k][e] = h;
+            }
+            if (tid < a.n_rot / 2) {
+                float y0, y1;
+                rope_pair(a.kv_raw[a.kv_lora + 2 * tid], a.kv_raw[a.kv_lora + 2 * tid + 1], tid, a.n_rot, a.p, a.base, y0, y1);
+                for (int k = 0; k < nt; ++k) {
+                    float* kp = (float*) (tg[k] + a.kv_lora);
+                    kp[2 * tid] = y0;
+                    kp[2 * tid + 1] = y1;
+                }
+            }
+            return;
+        }
         for (int e = tid; e < a.kv_lora; e += blockDim.x)
             a.lat[(size_t) a.p * a.kv_lora + e] = __half_as_ushort(__float2half(a.kv_raw[e] * inv * a.kv_norm[e]));
         if (tid < a.n_rot / 2) {
@@ -7089,6 +7124,11 @@ __global__ void rope_heads_kernel(float* __restrict__ x, int n_rot, int stride, 
 }
 
 // q_abs[h][c] = sum_e wk_b[h][c][e] * q_nope[h][e]   (wk_b BF16 {qk_nope, kv_lora, n_head}; q heads k_mla apart)
+// q_nope of every head, packed: qn[h][e] = q[k_mla * h + e]
+__global__ void pack_q_nope_kernel(const float* __restrict__ q, int k_mla, int qk_nope, float* __restrict__ qn) {
+    for (int e = threadIdx.x; e < qk_nope; e += blockDim.x) qn[(size_t) qk_nope * blockIdx.x + e] = q[(size_t) k_mla * blockIdx.x + e];
+}
+
 __global__ void mla_pe_qabs_kernel(const float* __restrict__ q, int k_mla, int qk_nope, const uint16_t* __restrict__ wk_b,
                                    int kv_lora, int n_head, float* __restrict__ q_abs) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -7107,7 +7147,7 @@ __global__ void __launch_bounds__(256) mla_pe_attend_kernel(const float* __restr
                                                             const uint16_t* __restrict__ lat,
                                                             const float* __restrict__ kpe, const int* __restrict__ cells,
                                                             int n_sel, const uint16_t* __restrict__ wv_b, int kv_lora,
-                                                            int v_head, float* __restrict__ out) {
+                                                            int v_head, float* __restrict__ out, int lat_ld, int kpe_ld) {
     extern __shared__ float sm[];
     float* prob = sm;                 // n_sel
     float* ctx = sm + n_sel;          // kv_lora
@@ -7122,10 +7162,10 @@ __global__ void __launch_bounds__(256) mla_pe_attend_kernel(const float* __restr
     float mx = -INFINITY;
     for (int s = tid; s < n_sel; s += blockDim.x) {
         const int cell = cells != nullptr ? cells[s] : s;
-        const uint16_t* lr = lat + (size_t) kv_lora * cell;
+        const uint16_t* lr = lat + (size_t) lat_ld * cell;
         float dot = 0.0f;
         for (int c = 0; c < kv_lora; ++c) dot += qa[c] * __half2float(__ushort_as_half(lr[c]));
-        const float* kr = kpe + (size_t) n_rot * cell;
+        const float* kr = kpe + (size_t) kpe_ld * cell;
         for (int e = 0; e < n_rot; ++e) dot += qp[e] * kr[e];
         prob[s] = dot * scale;
         mx = fmaxf(mx, prob[s]);
@@ -7141,7 +7181,7 @@ __global__ void __launch_bounds__(256) mla_pe_attend_kernel(const float* __restr
     for (int c = tid; c < kv_lora; c += blockDim.x) {
         float acc = 0.0f;
         for (int s = 0; s < n_sel; ++s)
-            acc += prob[s] * __half2float(__ushort_as_half(lat[(size_t) kv_lora * (cells != nullptr ? cells[s] : s) + c]));
+            acc += prob[s] * __half2float(__ushort_as_half(lat[(size_t) lat_ld * (cells != nullptr ? cells[s] : s) + c]));
         ctx[c] = acc * inv;
     }
     __syncthreads();
@@ -7168,14 +7208,56 @@ void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base
 
 void mla_pe(const float* q, int k_mla, int qk_nope, int n_rot, const uint16_t* wk_b, const uint16_t* wv_b,
             const uint16_t* lat, const float* kpe, const int* cells, int n_sel, int n_head, int kv_lora, int v_head,
-            float* scratch, void* out_q8_1, cudaStream_t s) {
+            float* scratch, void* out_q8_1, cudaStream_t s, int lat_ld, int kpe_ld) {
+    if (lat_ld <= 0) lat_ld = kv_lora;
+    if (kpe_ld <= 0) kpe_ld = n_rot;
+    // Flash's decode structure (mla): wk_b . q_nope by warp-per-row GEMVs, the attention split over cell chunks and
+    // head groups (mla_split_kernel + the q_pe . k_pe term) and merged, wv_b . ctx into q8_1.  STRATA_GLM_MLA_PE_NAIVE=1:
+    // the one-block-a-head kernels below (the parity reference)
+    static const bool naive = getenv("STRATA_GLM_MLA_PE_NAIVE") != nullptr;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (!naive && dev < 16 && kv_lora <= 512 && kv_lora % 32 == 0 && v_head % 32 == 0 && n_head <= 128) {
+        static float* buf[16] = {};
+        static int attr[16] = {};
+        const size_t smem = (size_t) MLA_CHUNK * kv_lora * sizeof(uint16_t) + (size_t) MLA_HPB * MLA_CHUNK * sizeof(float);
+        if (attr[dev] < (int) smem) {
+            if (cudaFuncSetAttribute(mla_split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) == cudaSuccess)
+                attr[dev] = (int) smem;
+            else
+                cudaGetLastError();
+        }
+        if (buf[dev] == nullptr &&
+            cudaMalloc(&buf[dev], (size_t) n_head * (2 * kv_lora + qk_nope) * sizeof(float)) != cudaSuccess) {
+            buf[dev] = nullptr;
+            cudaGetLastError();
+        }
+        const int n_chunks = (n_sel + MLA_CHUNK - 1) / MLA_CHUNK;
+        int cap = 0;
+        float* part = buf[dev] != nullptr && attr[dev] >= (int) smem ? mla_part(dev, n_head, kv_lora, n_chunks, &cap) : nullptr;
+        if (part != nullptr && cap >= n_chunks) {
+            float* q_abs = buf[dev];
+            float* ctx = q_abs + (size_t) n_head * kv_lora;
+            float* qn = ctx + (size_t) n_head * kv_lora;
+            pack_q_nope_kernel<<<n_head, 256, 0, s>>>(q, k_mla, qk_nope, qn);
+            headwise_gemv_kernel<<<n_head * kv_lora / 32, 256, 0, s>>>(wk_b, qn, kv_lora, qk_nope, q_abs, nullptr);
+            mla_split_kernel<<<dim3(n_chunks, (n_head + MLA_HPB - 1) / MLA_HPB), 256, smem, s>>>(
+                q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part, false, lat_ld, q + qk_nope, k_mla, kpe, kpe_ld,
+                n_rot, 1.0f / std::sqrt((float) (qk_nope + n_rot)));
+            mla_combine_kernel<<<n_head, 256, 0, s>>>(part, n_chunks, n_head, kv_lora, ctx);
+            headwise_gemv_kernel<<<n_head * v_head / 32, 256, 0, s>>>(wv_b, ctx, v_head, kv_lora, nullptr,
+                                                                      (block_q8_1*) out_q8_1);
+            launch_check("mla_pe split");
+            return;
+        }
+    }
     float* q_abs = scratch;
     float* out = scratch + (size_t) n_head * kv_lora;
     mla_pe_qabs_kernel<<<(kv_lora * n_head + 255) / 256, 256, 0, s>>>(q, k_mla, qk_nope, wk_b, kv_lora, n_head, q_abs);
     launch_check("mla_pe_qabs");
     const size_t smem = ((size_t) n_sel + 2 * kv_lora + n_rot) * sizeof(float);
     mla_pe_attend_kernel<<<n_head, 256, smem, s>>>(q_abs, q, k_mla, qk_nope, n_rot, lat, kpe, cells, n_sel, wv_b,
-                                                   kv_lora, v_head, out);
+                                                   kv_lora, v_head, out, lat_ld, kpe_ld);
     launch_check("mla_pe_attend");
     strata::kernels::quantize_q8_1_rows(out, 1, (int64_t) n_head * v_head, out_q8_1, s);
 }

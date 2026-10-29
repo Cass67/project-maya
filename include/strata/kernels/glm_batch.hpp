@@ -105,7 +105,8 @@ void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, c
 /// token t n_head * q_pe_hs further) before the scale.
 void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
                     int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false,
-                    const float* q_pe = nullptr, int q_pe_hs = 0, const float* kpe = nullptr, int n_rot = 0);
+                    const float* q_pe = nullptr, int q_pe_hs = 0, const float* kpe = nullptr, int n_rot = 0,
+                    int lat_ld = 512, int kpe_ld = 0);   // (strides in halves / floats; kpe_ld 0: n_rot)
 /// True on the current device where mla_attn_wmma2 runs (gfx11/gfx12); mla_wmma2_default() is true on gfx12 (RDNA4) and gfx1151 (Strix Halo),
 /// where the prompt path prefers it over mla_attn_f16q.
 bool mla_wmma2_supported();

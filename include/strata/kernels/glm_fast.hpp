@@ -462,6 +462,11 @@ struct DsaRopePrepArgs {
     // qr_q may then be null, qr16 (optional) takes qr's FP16
     int T = 1;
     uint16_t* qr16 = nullptr;
+    // rec > 0: a position's latent and k_pe are ONE record of rec halves ([kv_lora FP16 | n_rot F32]; kpe unused) at
+    // record p of each target - lat (the identity cache, or null), lat_host (KV streaming's host copy, or null) and
+    // lat_slots (row lat_table[p / lat_page] * lat_page + p % lat_page when that block is resident)
+    int rec = 0;
+    uint16_t* lat_host = nullptr; uint16_t* lat_slots = nullptr; const int* lat_table = nullptr; int lat_page = 1;
 };
 void dsa_rope_prep(const DsaRopePrepArgs& a, cudaStream_t s);
 /// ggml rope NORM on the first n_rot floats of n_head heads (head h at x + stride * h), at position pos; T rows ld floats
@@ -470,9 +475,10 @@ void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base
 /// glm-dsa's absorbed MLA for one token: q heads of [nope (qk_nope) | rope (n_rot)] k_mla apart; scores q_abs . latent +
 /// q_pe . k_pe over the cells (nullptr: every position 0 .. n_sel-1, the dense NextN block), / sqrt(qk_nope + n_rot);
 /// out_h = wv_b_h . ctx as q8_1.  scratch: n_head x (kv_lora + v_head).
+/// lat_ld / kpe_ld: a cell's latent / k_pe stride in halves / floats (0: kv_lora / n_rot - the separate caches).
 void mla_pe(const float* q, int k_mla, int qk_nope, int n_rot, const uint16_t* wk_b, const uint16_t* wv_b,
             const uint16_t* lat, const float* kpe, const int* cells, int n_sel, int n_head, int kv_lora, int v_head,
-            float* scratch, void* out_q8_1, cudaStream_t s);
+            float* scratch, void* out_q8_1, cudaStream_t s, int lat_ld = 0, int kpe_ld = 0);
 
 /// tab[keys[i]] = vals[i] for i < n (the expert-table edits the host queues between tokens).
 void tab_update(unsigned long long* tab, const int* keys, const unsigned long long* vals, int n, cudaStream_t s);

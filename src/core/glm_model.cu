@@ -997,11 +997,12 @@ int64_t Glm5Model::kv_resident() const {
 // an error.  Null with err empty: no DSA layer on this part.
 Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::string& err) {
     namespace k = strata::kernels;
-    const std::vector<int> ls = dsa_layers();
+    std::vector<int> ls = dsa_layers();
+    if (g_.dsa) std::erase(ls, mtp_il_);   // (glm-dsa's NextN block attends every position: its cache stays resident)
     if (ls.empty()) return nullptr;
     auto* K = new KvStream();
     K->page = g_.idx_kpool;
-    K->row_bytes = lat_q8_ ? k::glmf::lat8_rec_bytes(g_.kv_lora) : g_.kv_lora * 2;
+    K->row_bytes = dsa_rec_ > 0 ? dsa_rec_ * 2 : lat_q8_ ? k::glmf::lat8_rec_bytes(g_.kv_lora) : g_.kv_lora * 2;
     K->slots = cells / K->page;
     K->n_blocks = (ctx + K->page - 1) / K->page;
     const auto fail = [&](const std::string& e) {
@@ -1659,8 +1660,17 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     const int64_t kv_cells = fast ? Glm5Model::kv_resident_cells(g.idx_kpool, max_ctx) : 0;
     const double lat_rows = (double) (kv_cells > 0 ? kv_cells : max_ctx);
     const double lat = fast ? (double) g.kv_lora * lat_rows / 2 : (double) g.kv_lora * lat_rows;
-    const size_t kv_stage = kv_cells > 0 ? (size_t) g.kv_lora * 2 * (size_t) max_ctx : 0;
+    // glm-dsa's fast path: [latent FP16 | k_pe F32] records (load_pack's dsa_rec_), indexer keys on full layers only, and
+    // the NextN block resident at the whole context (it attends densely, KV streaming leaves it out)
+    const double dsa_rec_bytes = fast && g.dsa ? 2.0 * g.kv_lora + 4.0 * g.n_rot : 0.0;
+    const size_t kv_stage = kv_cells <= 0 ? 0
+                            : (size_t) (dsa_rec_bytes > 0 ? dsa_rec_bytes : 2.0 * g.kv_lora) * (size_t) max_ctx;
     const double dsa_state = 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
+    const auto dsa_state_of = [&](int l) {
+        if (dsa_rec_bytes <= 0) return dsa_state;
+        if (l >= g.n_layers) return dsa_rec_bytes * (double) max_ctx;   // (the NextN block)
+        return dsa_rec_bytes * lat_rows + (g.indexer_full[(size_t) l] ? 4.0 * g.idx_key * (double) max_ctx : 0.0);
+    };
     const double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
     // a DFlash drafter (STRATA_GLM_DFLASH): its file and ring on the last part; every part keeps the verify window's
     // buffers - per KDA layer its state backup and the window's inputs, and ~32 MB of rows and logits
@@ -1863,7 +1873,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         double bsum = 0, ssum = 0, smax = 0;
         bool kda = false, dsa = false, dense_ffn = false, moe = false;
         for (int l = lb; l < le; ++l) {
-            used += dense[(size_t) l] + (g.is_recr(l) ? kda_state + win_kda : dsa_state);
+            used += dense[(size_t) l] + (g.is_recr(l) ? kda_state + win_kda : dsa_state_of(l));
             (g.is_recr(l) ? kda : dsa) = true;
             if (moe_layer(l)) {
                 bsum += blob[(size_t) l];
@@ -1877,7 +1887,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if (last) {
             used += head + dflash;
             if (mtp) {
-                used += mtp_dense + dsa_state;
+                used += mtp_dense + dsa_state_of(g.n_layers);
                 bsum += blob[(size_t) L];
                 ssum += stride[(size_t) L];
                 smax = std::max(smax, stride[(size_t) L]);
@@ -3618,8 +3628,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
               std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0;
     // KV streaming (--kv-resident N): the latent cache lives in pinned RAM and the state holds N positions of VRAM slots
     // a layer (kv_stream_setup, below)
-    const int64_t kv_cells = fast_mode_ && !g_.dsa ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;   // (glm-dsa: not yet)
+    const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;
     const int64_t lat_rows = kv_cells > 0 ? kv_cells : max_ctx;
+    // glm-dsa's fast path keeps a cell's latent and roped k_pe as one record (one row for KV streaming to page)
+    dsa_rec_ = fast_mode_ && g_.dsa ? g_.kv_lora + 2 * g_.n_rot : 0;
+    const int64_t rec_floats = dsa_rec_ / 2;
     // (INT8: lat8_rec_bytes per position, a multiple of 16 bytes at kv_lora 512)
     const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
                                : fast_mode_ ? (int64_t) g_.kv_lora * lat_rows / 2
@@ -3637,7 +3650,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // the indexer key / gate caches: a ring on the fast path (the prompt path's largest sub-batch + 64 positions; see
     // ik_ring_), the whole context on the reference path (whose kernels index them by position)
     ik_ring_ = fast_mode_ ? (int) std::min<int64_t>(max_ctx, 8192 + 64) : (int) max_ctx;
-    if (mtp_il_ >= 0 && g_.dsa) {   // glm-dsa's block: the latent and k_pe only (it attends densely)
+    if (mtp_il_ >= 0 && g_.dsa && dsa_rec_ > 0) {   // glm-dsa's block attends densely: every position resident
+        dsa_lat_[(size_t) mtp_il_] = floats;
+        dsa_kpe_[(size_t) mtp_il_] = floats + g_.kv_lora / 2;
+        floats += rec_floats * max_ctx;
+    } else if (mtp_il_ >= 0 && g_.dsa) {   // glm-dsa's block: the latent and k_pe only (it attends densely)
         dsa_lat_[(size_t) mtp_il_] = floats;
         floats += lat_floats;
         dsa_kpe_[(size_t) mtp_il_] = floats;
@@ -3659,7 +3676,13 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;
             kda_conv_[(size_t) il] = floats;
             floats += (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
-        } else if (g_.dsa) {   // the latent (FP16 on the fast path), F32 k_pe and indexer keys of every position
+        } else if (g_.dsa && dsa_rec_ > 0) {   // records (lat_rows: the VRAM slots when streamed); indexer keys of
+            dsa_lat_[(size_t) il] = floats;     // every position on the full indexer layers only (shared ones reuse)
+            dsa_kpe_[(size_t) il] = floats + g_.kv_lora / 2;
+            floats += rec_floats * lat_rows;
+            dsa_pool_[(size_t) il] = floats;
+            if (g_.indexer_full[(size_t) il]) floats += (int64_t) g_.idx_key * max_ctx;
+        } else if (g_.dsa) {   // the latent (F32 on the reference path), F32 k_pe and indexer keys of every position
             dsa_lat_[(size_t) il] = floats;
             floats += lat_floats;
             dsa_kpe_[(size_t) il] = floats;

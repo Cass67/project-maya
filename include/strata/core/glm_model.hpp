@@ -333,6 +333,8 @@ private:
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
     std::vector<int64_t> dsa_kpe_;                // glm-dsa: the roped k_pe cache (n_rot per cell)
+    int dsa_rec_ = 0;                             // glm-dsa fast path: a cell's record in halves, [latent FP16 | k_pe
+                                                  // F32] (dsa_kpe_ points into the first record); 0 = separate caches
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the

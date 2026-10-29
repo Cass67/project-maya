@@ -5647,6 +5647,7 @@ bool Glm5Model::fast_mtp_cache_rope(int64_t p, const float* h, const float* emb,
     d.kv_norm = Ly.kv_a_norm;
     d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
     d.kpe = state_ + dsa_kpe_[(size_t) mtp_il_];
+    d.rec = dsa_rec_;
     d.kv_lora = g.kv_lora;
     d.n_rot = g.n_rot;
     d.base = g.rope_base;
@@ -5680,6 +5681,7 @@ bool Glm5Model::fast_dsa_rope(int il, int64_t p, std::string& err) {
                        gf::kTypeBF16, g.n_embd, g.idx_heads};
     }
     if (!gf::mv(j, nj, s)) { err = "glm fast: dsa projections"; return false; }
+    if (F->prof_on) F->mark("dsa_proj_mv");
     uint16_t* lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
     float* kpe = state_ + dsa_kpe_[(size_t) il];
     float* ik = state_ + dsa_pool_[(size_t) il];
@@ -5693,6 +5695,14 @@ bool Glm5Model::fast_dsa_rope(int il, int64_t p, std::string& err) {
     d.kv_norm = Ly.kv_a_norm;
     d.lat = lat;
     d.kpe = kpe;
+    d.rec = dsa_rec_;
+    if (kv_streamed(kv_, il)) {   // KV streaming: the host copy and the block's VRAM slot (when resident)
+        d.lat = nullptr;
+        d.lat_host = (uint16_t*) kv_->host[(size_t) il];
+        d.lat_slots = lat;
+        d.lat_table = kv_->map[(size_t) il].page_table;
+        d.lat_page = kv_->page;
+    }
     d.kv_lora = g.kv_lora;
     d.n_rot = g.n_rot;
     d.ik_raw = full ? F->ik_raw : nullptr;
@@ -5710,6 +5720,7 @@ bool Glm5Model::fast_dsa_rope(int il, int64_t p, std::string& err) {
     j2[1] = {Ly.idx_q_b, nullptr, F->qr, F->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora, g.idx_heads * g.idx_key};
     if (!gf::mv(j2, full && !all ? 2 : 1, s)) { err = "glm fast: dsa q"; return false; }
     gf::rope_heads(F->q + g.qk_nope, g.n_rot, g.k_mla(), g.n_head, (int) p, g.rope_base, s);
+    if (F->prof_on) F->mark("dsa_prep_q");
     if (full) {
         F->dsa_n_sel = std::min(g.idx_top_k, n_vis);
         if (all) {
@@ -5723,12 +5734,17 @@ bool Glm5Model::fast_dsa_rope(int il, int64_t p, std::string& err) {
         err = "glm fast: glm-dsa layer " + std::to_string(il) + " shares an indexer selection this part never made";
         return false;
     }
-    gf::mla_pe(F->q, g.k_mla(), g.qk_nope, g.n_rot, Ly.k_b, Ly.v_b, lat, kpe, dense ? nullptr : F->cells,
-               dense ? n_vis : F->dsa_n_sel, g.n_head, g.kv_lora, g.v_head, F->qabs, F->attn_q, s);
+    if (F->prof_on) F->mark("dsa_index");
+    // KV streaming: the selected cells into VRAM slots, the attention reading the selection in slot rows
+    const int* cells = dense ? nullptr : kv_attend_cells(kv_, il, lat, F->cells, F->dsa_n_sel, F->slot_cells, s);
+    gf::mla_pe(F->q, g.k_mla(), g.qk_nope, g.n_rot, Ly.k_b, Ly.v_b, lat, kpe, cells, dense ? n_vis : F->dsa_n_sel,
+               g.n_head, g.kv_lora, g.v_head, F->qabs, F->attn_q, s, dsa_rec_, dsa_rec_ / 2);
+    if (F->prof_on) F->mark("dsa_mla");
     if (dumps) fast_dump(s, "kqv_out-" + std::to_string(il), F->qabs + (size_t) g.n_head * g.kv_lora,
                          (int64_t) g.n_head * g.v_head);
     gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head, g.n_embd};
     if (!gf::mv(&o, 1, s)) { err = "glm fast: dsa output"; return false; }
+    if (F->prof_on) F->mark("dsa_out_mv");
     return true;
 }
 
