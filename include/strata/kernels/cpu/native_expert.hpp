@@ -18,8 +18,8 @@ namespace strata::kernels::cpu {
 /// Q8_K (10 x 292 = 2604); glm5-next: 4096 values as Q8_K (16 x 260 = 4164).
 inline constexpr size_t kNativeActBytes = 8192;
 /// Bytes of the largest quantized down activation.  qwen4exp: 640 values as Q8_0/Q8_K (1024);
-/// glm5-next: 2048 values as Q8_K (8 x 260 = 2084).
-inline constexpr size_t kNativeHBytes = 4096;
+/// glm5-next: 2048 values as Q8_K (8 x 260 = 2084); mistral-large4: 6144 as Q8_K (24 x 292 = 7008).
+inline constexpr size_t kNativeHBytes = 8192;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
