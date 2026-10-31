@@ -544,13 +544,24 @@ int main(int argc, char** argv) {
         std::vector<float> lg;
         std::string gen;
         const auto begin = std::chrono::steady_clock::now();
-        for (int i = 0; i < count; ++i) {
-            const int tok = model.sample_token(sp, err);
-            if (tok < 0 || !model.forward({tok}, lg, err)) {
+        if (model.dflash_ready()) {   // (STRATA_GLM_DFLASH: the drafter's decode)
+            int64_t produced = 0;
+            if (!model.decode_dflash(sp, count, -1, -1.0f, [&](int tok) {
+                    gen += (gen.empty() ? "" : ",") + std::to_string(tok);
+                    return true;
+                }, produced, err)) {
                 std::fprintf(stderr, "gen: %s\n", err.c_str());
                 return 1;
             }
-            gen += (i ? "," : "") + std::to_string(tok);
+        } else {
+            for (int i = 0; i < count; ++i) {
+                const int tok = model.sample_token(sp, err);
+                if (tok < 0 || !model.forward({tok}, lg, err)) {
+                    std::fprintf(stderr, "gen: %s\n", err.c_str());
+                    return 1;
+                }
+                gen += (i ? "," : "") + std::to_string(tok);
+            }
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
         std::printf("GEN tokens=%d tok_s=%.3f ms_tok=%.1f ids=%s\n", count, count * 1000.0 / ms, ms / count, gen.c_str());

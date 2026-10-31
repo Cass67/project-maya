@@ -6296,6 +6296,7 @@ bool Glm5Model::fast_layers_dsa(int64_t p, std::string& err) {
         if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
     }
     dsa_add_kernel<<<(g.n_embd + 255) / 256, 256, 0, s>>>(state_, F->ffn, g.n_embd);
+    if (l1_ == g.n_layers) dflash_capture(g.n_layers, state_, 1, p, F->cap, F->cap_rows, s);   // (the final residual)
     if (dumps) fast_dump(s, "l_out-" + std::to_string(l1_ - 1), state_, g.n_embd);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

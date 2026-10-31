@@ -898,6 +898,10 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
             ~Restore() { f->x = x; f->mixer = mixer; f->xq = xq; f->cells = cells; f->dsa_n_sel = n_sel; }
         } restore{F, F->x, F->mixer, F->xq, F->cells, F->dsa_n_sel};
         float* R = W.R[0];
+        if (kvm_host_ != nullptr && !kvm_writer_)   // mistral-large4: the KV source's records of the rows, earlier part's
+            cudaMemcpyAsync((uint16_t*) (state_ + dsa_lat_[(size_t) kvm_src_]) + (size_t) p0 * dsa_rec_,
+                            kvm_host_ + (size_t) p0 * dsa_rec_, (size_t) T * dsa_rec_ * sizeof(uint16_t),
+                            cudaMemcpyHostToDevice, s);
         const int NS = g.n_sel_max();
         static const bool wtrace = getenv("STRATA_GLM_WIN_TRACE") != nullptr;   // (debug: sync + print each step)
         const auto step = [&](const char* what, int il, int t) {
@@ -928,9 +932,11 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
             if (!(Ly.moe ? fast_moe_window(il, 0, T, 0, 0, err) : dense_ffn(il, 0, T))) return false;
             step(Ly.moe ? "moe" : "dense", il, -1);
         }
-        for (int t = 0; t < T; ++t)   // the last layer's write: R += ffn (gf::rms_q8's add, its norm output unused)
+        for (int t = 0; t < T; ++t) {   // the last layer's write: R += ffn (gf::rms_q8's add, its norm output unused)
             gf::rms_q8(R + (size_t) t * E, W.ffn + (size_t) t * E, F->L[(size_t) (l1_ - 1)].ffn_norm, g.norm_eps, E,
                        W.x + (size_t) t * E, (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
+            if (l1_ == g.n_layers) dflash_capture(g.n_layers, R + (size_t) t * E, 1, p0 + t, F->cap, F->cap_rows, s);
+        }
         W.out = 0;
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {

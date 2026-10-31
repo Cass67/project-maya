@@ -5940,6 +5940,10 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
 }
 
 void quantize_q8_1(const float* x, void* xq, int n, cudaStream_t s) {
+    if (n <= 0) {
+        std::fprintf(stderr, "glm_fast quantize: %d values\n", n);
+        return;
+    }
     quantize_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, (block_q8_1*) xq, n);
     launch_check("quantize");
 }

@@ -2151,7 +2151,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // updates, but omit the output projection and FFN (including both mHC write halves). Split boundaries and seam
     // dumps consume these rows, so keep their full path. STRATA_GLM_PREFILL_TAIL_SKIP=0 is the A/B baseline.
     const char* tail_env = getenv("STRATA_GLM_PREFILL_TAIL_SKIP");
-    const bool tail_skip = l0_ == 0 && l1_ == g.n_layers && split_next_ == nullptr && mtp_il_ < 0 &&
+    const bool tail_skip = l0_ == 0 && l1_ == g.n_layers && split_next_ == nullptr && mtp_il_ < 0 && cap_d_ == nullptr &&
                            (cb_dir == nullptr || !cb_dir[0]) && (tail_env == nullptr || std::atoi(tail_env) != 0);
     const auto dump_row = [&](const std::string& name, const float* rows, int width, int row = -1) {
         if (cb_dir == nullptr || !cb_dir[0]) return;
@@ -4143,6 +4143,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const int64_t n = (int64_t) T * E;
             add_f32_kernel<<<(unsigned) std::min<int64_t>(4096, (n + 255) / 256), 256, 0, s>>>(S->R, S->ffn, n);
         } else gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
+        if (l1_ == g.n_layers) dflash_capture(g.n_layers, S->R, T, p0, S->mixer, T, s);   // (the final residual)
         S->mark("hc", s);
     }
     // ---- the NextN block's caches for these positions (the half that carries it): position p reads h_p and the

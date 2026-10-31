@@ -693,7 +693,227 @@ struct GlmDflash::Impl {
     } hs;
 
     size_t q8(int n) const { return (size_t) n / 32 * 36; }
+
+    // mistral-large4's DSpark (dflash with kv_lora_rank): MLA blocks and the Markov head - glm_dflash.cu's tail
+    struct Mla;
+    std::unique_ptr<Mla> mla;
 };
+
+// ---------------------------------------------------------------- mistral-large4's DSpark (llama.cpp dflash.cpp
+// graph_mistral_large4 + build_dspark_markov_head, common/speculative.cpp's draft-dspark):
+//   context, position p: g = rms(fc . [the trunk's features]) * enc.output_norm; per layer the ring holds
+//     latent = rms(kv_a(g)[:kv_lora]) * kv_a_norm and k_pe = YaRN-rope_p(kv_a(g)[kv_lora:]) (no rope_freqs).
+//   block, rows t = 0..B-1 at n_past + t: h = [emb(anchor), mask_embd[0..B-2]]; per layer: x = rms(h) * attn_norm,
+//     q = Wq x (heads [nope | rope], the rope at the row's position), q_abs = wk_b . q_nope; EVERY row attends the ring's
+//     positions [n_past - window, n_past) and the anchor row's own key (llama.cpp's block mask repeats row 0's);
+//     scores (q_abs . latent + q_pe . k_pe) / sqrt(k_mla), ctx = softmax . latent, out = wv_b . ctx; h += Wo out;
+//     h += Wdown (silu(Wgate x) * Wup x), x = rms(h) * ffn_norm.  y = rms(h) * output_norm, logits = the target's
+//     head(y), softcapped; then the Markov chain row by row: joint = joint_proj . [state | w1[prev] | y_t] + b,
+//     state = tanh(c1) + sigmoid(c0) * (state - tanh(c1)), logits_t += w2 . tanh(c2), prev = argmax - the draft t
+//     (prev starts at the anchor: sample_from_anchor, so B rows give B drafts).
+struct GlmDflash::Impl::Mla {
+    int kv_lora = 0, n_rot = 0, k_mla = 0, nope = 0, v_mla = 0, R = 0, B = 0;
+    float softcap = 0.0f, freq_scale = 1.0f, ext = 0.0f, lo = 0.0f, hi = 0.0f, mscale = 1.0f;
+    struct Layer {
+        const float *attn_norm = nullptr, *ffn_norm = nullptr, *kv_norm = nullptr;
+        float *k_b = nullptr, *v_b = nullptr;   // F32 copies: (n_head, kv_lora, nope), (n_head, v_mla, kv_lora)
+        Impl::Mat q, kv_a, o, gate, up, down;
+    };
+    std::vector<Layer> L;
+    Impl::Mat w2, joint;
+    const float* joint_b = nullptr;
+    const uint8_t* w1 = nullptr;   // Q8_0 rows of R
+    std::vector<float> mask_rows;  // (B - 1) x E
+    float *ring_lat = nullptr, *ring_kpe = nullptr;   // per layer ring x kv_lora / ring x n_rot
+    void* buf = nullptr;
+    float *kvraw = nullptr, *q = nullptr, *qabs = nullptr, *anc = nullptr, *att = nullptr, *state = nullptr,
+          *jvec = nullptr, *jout = nullptr, *mk = nullptr, *bias = nullptr;
+    void *jq = nullptr, *mq = nullptr;
+    int* prev = nullptr;
+    ~Mla() {
+        if (buf) cudaFree(buf);
+        if (ring_lat) cudaFree(ring_lat);
+        for (auto& l : L) {
+            if (l.k_b) cudaFree(l.k_b);
+            if (l.v_b) cudaFree(l.v_b);
+        }
+    }
+};
+
+namespace {
+
+__device__ __forceinline__ void mla_rope(float& x0, float& x1, int i, int n_rot, int64_t pos, float base, float fs,
+                                         float ext, float lo, float hi, float msc) {
+    const float theta_scale = powf(base, -2.0f / (float) n_rot);
+    float theta = (float) pos;
+    for (int k = 0; k < i; ++k) theta *= theta_scale;
+    float t = fs * theta;
+    if (ext != 0.0f) {
+        const float mix = (1.0f - fminf(1.0f, fmaxf(0.0f, ((float) i - lo) / fmaxf(0.001f, hi - lo)))) * ext;
+        t = t * (1.0f - mix) + theta * mix;
+    }
+    const float c = cosf(t) * msc, sn = sinf(t) * msc;
+    const float a = x0, b = x1;
+    x0 = a * c - b * sn;
+    x1 = a * sn + b * c;
+}
+
+// a row of kv_a's output (kv_lora + n_rot) -> the latent (rms * w) and the roped k_pe at position pos0 + row; into
+// the ring (slot pos % ring) or, ring == 0, rows of lat / kpe
+__global__ void mla_kv_kernel(const float* __restrict__ raw, const float* __restrict__ w, float eps, int kv_lora,
+                              int n_rot, int64_t pos0, int ring, float* __restrict__ lat, float* __restrict__ kpe,
+                              float base, float fs, float ext, float lo, float hi, float msc) {
+    __shared__ float red[32];
+    const int row = blockIdx.x;
+    const float* x = raw + (size_t) row * (kv_lora + n_rot);
+    const int64_t pos = pos0 + row;
+    const size_t slot = ring > 0 ? (size_t) (pos % ring) : (size_t) row;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < kv_lora; i += blockDim.x) ss += x[i] * x[i];
+    const float r = rsqrtf(block_sum(ss, red) / (float) kv_lora + eps);
+    for (int i = threadIdx.x; i < kv_lora; i += blockDim.x) lat[slot * kv_lora + i] = x[i] * r * w[i];
+    for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) {
+        float a = x[kv_lora + 2 * i], b = x[kv_lora + 2 * i + 1];
+        mla_rope(a, b, i, n_rot, pos, base, fs, ext, lo, hi, msc);
+        kpe[slot * n_rot + 2 * i] = a;
+        kpe[slot * n_rot + 2 * i + 1] = b;
+    }
+}
+
+// per (head, row): the rope part of q at n_past + row, q_abs = wk_b[h] . q_nope
+__global__ void mla_q_kernel(float* __restrict__ q, int n_head, int k_mla, int nope, int n_rot, int kv_lora,
+                             const float* __restrict__ kb, int64_t n_past, float* __restrict__ qabs, float base, float fs,
+                             float ext, float lo, float hi, float msc) {
+    const int h = blockIdx.x, row = blockIdx.y;
+    float* qh = q + ((size_t) row * n_head + h) * k_mla;
+    for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) {
+        float a = qh[nope + 2 * i], b = qh[nope + 2 * i + 1];
+        mla_rope(a, b, i, n_rot, n_past + row, base, fs, ext, lo, hi, msc);
+        qh[nope + 2 * i] = a;
+        qh[nope + 2 * i + 1] = b;
+    }
+    __syncthreads();
+    const float* w = kb + (size_t) h * kv_lora * nope;
+    for (int c = threadIdx.x; c < kv_lora; c += blockDim.x) {
+        float acc = 0.0f;
+        for (int e = 0; e < nope; ++e) acc += w[(size_t) c * nope + e] * qh[e];
+        qabs[((size_t) row * n_head + h) * kv_lora + c] = acc;
+    }
+}
+
+// per (head, row): attention over the ring's positions [lo, n_past) it holds and the anchor's key, then wv_b
+__global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__ qabs, const float* __restrict__ q,
+                                                       const float* __restrict__ rl, const float* __restrict__ rk,
+                                                       const long long* __restrict__ kv_pos, int ring, int64_t lo,
+                                                       int64_t n_past, const float* __restrict__ alat,
+                                                       const float* __restrict__ akpe, int n_head, int k_mla, int nope,
+                                                       int n_rot, int kv_lora, int v_mla, const float* __restrict__ vb,
+                                                       float scale, float* __restrict__ out) {
+    extern __shared__ float sm[];
+    const int nk = (int) (n_past - lo) + 1;   // the ring's positions, then the anchor
+    float* sc = sm;                           // nk
+    float* ctx = sm + nk;                     // kv_lora
+    __shared__ float red[32];
+    const int h = blockIdx.x, row = blockIdx.y;
+    const float* qa = qabs + ((size_t) row * n_head + h) * kv_lora;
+    const float* qp = q + ((size_t) row * n_head + h) * k_mla + nope;
+    for (int j = threadIdx.x; j < nk; j += blockDim.x) {
+        const float *lat, *kp;
+        if (j == nk - 1) {
+            lat = alat;
+            kp = akpe;
+        } else {
+            const int64_t p = lo + j;
+            const size_t sl = (size_t) (p % ring);
+            if (kv_pos[sl] != p) {
+                sc[j] = -INFINITY;
+                continue;
+            }
+            lat = rl + sl * kv_lora;
+            kp = rk + sl * n_rot;
+        }
+        float d = 0.0f;
+        for (int c = 0; c < kv_lora; ++c) d += qa[c] * lat[c];
+        for (int e = 0; e < n_rot; ++e) d += qp[e] * kp[e];
+        sc[j] = d * scale;
+    }
+    __syncthreads();
+    float mx = -INFINITY;
+    for (int j = threadIdx.x; j < nk; j += blockDim.x) mx = fmaxf(mx, sc[j]);
+    {
+        __shared__ float rm[32];
+        const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        if (lane == 0) rm[w] = mx;
+        __syncthreads();
+        mx = -INFINITY;
+        for (int i = 0; i < (int) (blockDim.x >> 5); ++i) mx = fmaxf(mx, rm[i]);
+    }
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < nk; j += blockDim.x) {
+        const float e = sc[j] == -INFINITY ? 0.0f : expf(sc[j] - mx);
+        sc[j] = e;
+        sum += e;
+    }
+    const float inv = 1.0f / block_sum(sum, red);
+    __syncthreads();
+    for (int c = threadIdx.x; c < kv_lora; c += blockDim.x) {
+        float a = 0.0f;
+        for (int j = 0; j < nk; ++j) {
+            if (sc[j] == 0.0f) continue;
+            const float* lat = j == nk - 1 ? alat : rl + (size_t) ((lo + j) % ring) * kv_lora;
+            a += sc[j] * lat[c];
+        }
+        ctx[c] = a * inv;
+    }
+    __syncthreads();
+    const float* w = vb + (size_t) h * v_mla * kv_lora;
+    for (int v = threadIdx.x; v < v_mla; v += blockDim.x) {
+        float a = 0.0f;
+        for (int c = 0; c < kv_lora; ++c) a += w[(size_t) v * kv_lora + c] * ctx[c];
+        out[(size_t) row * n_head * v_mla + (size_t) h * v_mla + v] = a;
+    }
+}
+
+__global__ void mla_softcap_kernel(float* __restrict__ x, size_t n, float cap) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = tanhf(x[i] / cap) * cap;
+}
+
+// the Markov step's input: [state | w1[*prev] (Q8_0 row of R) | y]
+__global__ void markov_in_kernel(const float* __restrict__ state, const uint8_t* __restrict__ w1, const int* __restrict__ prev,
+                                 const float* __restrict__ y, int R, int E, float* __restrict__ out) {
+    const int n = 2 * R + E;
+    const BlkQ8_0* row = (const BlkQ8_0*) (w1 + (size_t) *prev * (size_t) (R / 32) * sizeof(BlkQ8_0));
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float v;
+        if (i < R) v = state[i];
+        else if (i < 2 * R) {
+            const int k = i - R;
+            v = __half2float(row[k / 32].d) * (float) row[k / 32].qs[k % 32];
+        } else v = y[i - 2 * R];
+        out[i] = v;
+    }
+}
+
+// joint (3R, bias added) -> the state update and the Markov vector tanh(c2)
+__global__ void markov_gate_kernel(const float* __restrict__ j, const float* __restrict__ b, int R, float* __restrict__ state,
+                                   float* __restrict__ mk) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= R) return;
+    const float g = 1.0f / (1.0f + expf(-(j[i] + b[i])));
+    const float c = tanhf(j[R + i] + b[R + i]);
+    state[i] = c + g * (state[i] - c);
+    mk[i] = tanhf(j[2 * R + i] + b[2 * R + i]);
+}
+
+__global__ void add_rows_kernel(float* __restrict__ a, const float* __restrict__ b, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += b[i];
+}
+
+}  // namespace
 
 GlmDflash::GlmDflash() : d_(new Impl) {}
 
@@ -751,6 +971,9 @@ int GlmDflash::ctx() const { return d_->window; }
 const std::vector<int>& GlmDflash::target_layers() const { return d_->tl; }
 size_t GlmDflash::bytes() const {
     const Impl& m = *d_;
+    if (m.mla)
+        return m.arena_bytes + m.buf_bytes + (size_t) m.n_layer * m.ring * (m.mla->kv_lora + m.mla->n_rot) * sizeof(float) +
+               (size_t) m.ring * sizeof(long long);
     return m.arena_bytes + m.buf_bytes + (size_t) 2 * m.n_layer * m.ring * m.n_kv * kHeadDim * sizeof(__half) +
            (size_t) m.ring * sizeof(long long);
 }
@@ -760,12 +983,25 @@ std::string GlmDflash::describe() const {
     std::string t;
     for (size_t i = 0; i < m.tl.size(); ++i) t += (i ? "," : "") + std::to_string(m.tl[i]);
     char b[320];
+    if (m.mla) {
+        std::snprintf(b, sizeof b, "DSpark (MLA): %d layers, hidden %d, %d heads, kv_lora %d + rope %d, block %d, "
+                                   "window %d, Markov rank %d, reads trunk layers %s; %.0f MB on CUDA%d",
+                      m.n_layer, m.E, m.n_head, m.mla->kv_lora, m.mla->n_rot, m.mla->B, m.window, m.mla->R, t.c_str(),
+                      (double) bytes() / 1048576.0, m.dev);
+        return b;
+    }
     std::snprintf(b, sizeof b, "%d layers, hidden %d, %d heads (%d kv), block %d, window %d, selector top-%d rank %d, "
                                "reads trunk layers %s; %.0f MB on CUDA%d",
                   m.n_layer, m.E, m.n_head, m.n_kv, m.block, m.window, m.top_k, m.rank, t.c_str(),
                   (double) bytes() / 1048576.0, m.dev);
     return b;
 }
+
+static bool dspark_mla_load(GlmDflash::Impl& m, const strata::GgufFile& G, const std::string& path, int dev,
+                            std::string& err);
+static bool dspark_mla_inject(GlmDflash::Impl& m, int64_t lo, int64_t hi, cudaStream_t s, std::string& err);
+static bool dspark_mla_draft(GlmDflash::Impl& m, int32_t anchor, int64_t n_past, int n_max, float p_min,
+                             const WSlot& head, const uint8_t* emb, int emb_type, cudaStream_t s, std::string& err);
 
 bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
     Impl& m = *d_;
@@ -789,6 +1025,7 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
         const auto* v = G.get(std::string("dflash.") + k);
         return v != nullptr && v->is_num() ? v->num() : def;
     };
+    if (G.get("dflash.attention.kv_lora_rank") != nullptr) return dspark_mla_load(m, G, path, dev, err);
     m.E = (int) num("embedding_length", 0);
     m.n_layer = (int) num("block_count", 0);
     m.n_head = (int) num("attention.head_count", 0);
@@ -1034,8 +1271,8 @@ bool GlmDflash::bind(int target_embd, int target_vocab, int target_layers, std::
               std::to_string(target_vocab) + ")";
         return false;
     }
-    for (int l : m.tl)
-        if (l < 0 || l >= target_layers) {
+    for (int l : m.tl)   // (mistral-large4's DSpark reads the final residual too: layer target_layers)
+        if (l < 0 || l > target_layers || (l == target_layers && !m.mla)) {
             err = "glm dflash: the draft reads layer " + std::to_string(l) + " of a " + std::to_string(target_layers) +
                   "-layer model";
             return false;
@@ -1111,9 +1348,418 @@ static bool mv_cols(gf::MvJob j, int cols, size_t xq_s, size_t xf_s, size_t y_s,
     return true;
 }
 
+// ---- mistral-large4's DSpark: load (the dflash.* keys of an MLA draft), inject, draft
+static bool dspark_mla_load(GlmDflash::Impl& m, const strata::GgufFile& G, const std::string& path, int dev,
+                            std::string& err) {
+    using Mla = GlmDflash::Impl::Mla;
+    m.mla.reset(new Mla);
+    Mla& a = *m.mla;
+    const auto num = [&](const char* k, double def) {
+        const auto* v = G.get(std::string("dflash.") + k);
+        return v != nullptr && v->is_num() ? v->num() : def;
+    };
+    m.E = (int) num("embedding_length", 0);
+    m.n_layer = (int) num("block_count", 0);
+    m.n_head = (int) num("attention.head_count", 0);
+    m.n_kv = 1;
+    m.n_ff = (int) num("feed_forward_length", 0);
+    a.B = (int) num("block_size", 3);
+    m.block = a.B + 1;   // (block(): the anchor and up to block - 1 drafts - DSpark drafts from the anchor's row on)
+    m.window = (int) num("attention.sliding_window", 2048);
+    m.eps = (float) num("attention.layer_norm_rms_epsilon", 1e-5);
+    m.rope_base = (float) num("rope.freq_base", 10000.0);
+    a.kv_lora = (int) num("attention.kv_lora_rank", 512);
+    a.n_rot = (int) num("rope.dimension_count", 64);
+    a.k_mla = (int) num("attention.key_length_mla", 128);
+    a.v_mla = (int) num("attention.value_length_mla", 128);
+    a.nope = a.k_mla - a.n_rot;
+    a.softcap = (float) num("final_logit_softcapping", 0.0);
+    {
+        const auto* st = G.get("dflash.rope.scaling.type");
+        const double factor = num("rope.scaling.factor", 1.0);
+        if (st != nullptr && st->s == "yarn" && factor != 1.0) {
+            a.freq_scale = (float) (1.0 / factor);
+            a.ext = 1.0f;
+            const int n_orig = (int) num("rope.scaling.original_context_length", 4096);
+            const auto corr = [&](float beta) {
+                return a.n_rot * logf((float) n_orig / (beta * 2 * (float) M_PI)) / (2 * logf(m.rope_base));
+            };
+            a.lo = std::max(0.0f, floorf(corr((float) num("rope.scaling.yarn_beta_fast", 32.0))));
+            a.hi = std::min((float) (a.n_rot - 1), ceilf(corr((float) num("rope.scaling.yarn_beta_slow", 1.0))));
+            const float f = (float) factor;
+            const auto gm = [&](float mm) { return f <= 1.0f ? 1.0f : 0.1f * mm * logf(f) + 1.0f; };
+            const float log_mul = (float) num("rope.scaling.yarn_log_multiplier", 0.0);
+            float at = log_mul != 0.0f ? gm(1.0f) / gm(log_mul) : gm(1.0f);
+            at *= 1.0f / (1.0f + 0.1f * logf(f));
+            a.mscale = at * (1.0f + 0.1f * logf(1.0f / a.freq_scale));
+        }
+    }
+    if (const auto* tlv = G.get("dflash.target_layers"); tlv != nullptr && tlv->type == strata::MetaType::ARRAY)
+        for (const auto& it : tlv->items) m.tl.push_back((int) it.num());
+    m.K = (int) m.tl.size();
+    if (const auto* c = G.get("dflash.sample_from_anchor"); c != nullptr && c->is_num() && c->u == 0) {
+        err = "glm dflash: " + path + ": a DSpark draft with a bonus anchor slot (sample_from_anchor false) is not run";
+        return false;
+    }
+    if (m.E <= 0 || m.n_layer <= 0 || m.n_head <= 0 || m.n_ff <= 0 || m.K <= 0 || m.K > 32 || a.B < 1 ||
+        a.B > gf::kMaxMvCols || a.nope <= 0 || a.kv_lora % 32 || m.E % 32 || m.n_ff % 32) {
+        err = "glm dflash: " + path + ": incomplete or unsupported DSpark (MLA) metadata";
+        return false;
+    }
+    m.ring = m.window + 2 * gf::kMaxMvCols;
+    // ---- the weights: every tensor raw into one arena (k_b / v_b / mask_embd also dequantized)
+    std::vector<const strata::TensorInfo*> ts;
+    size_t total = 0;
+    const auto al = [](size_t b) { return (b + 255u) & ~(size_t) 255u; };
+    const auto tbytes = [](const strata::TensorInfo& t) -> size_t {
+        int el = 0, by = 0;
+        if (!strata::block_geometry(t.type, el, by)) return 0;
+        return (size_t) (t.elements() / (uint64_t) el) * (size_t) by;
+    };
+    for (const auto& t : G.tensors()) {
+        ts.push_back(&t);
+        total += al(tbytes(t));
+    }
+    if (!ck(cudaSetDevice(dev), "set device", err) || !ck(cudaMalloc(&m.arena, total), "weights", err)) return false;
+    m.arena_bytes = total;
+    std::map<std::string, std::pair<const void*, const strata::TensorInfo*>> at;
+    {
+        uint8_t* p = (uint8_t*) m.arena;
+        for (const auto* t : ts) {
+            const size_t b = tbytes(*t);
+            if (b == 0) {
+                err = "glm dflash: tensor " + t->name + " has type " + t->type_name() + " (unsupported)";
+                return false;
+            }
+            if (!ck(cudaMemcpy(p, G.tensor_data(*t), b, cudaMemcpyHostToDevice), "weights upload", err)) return false;
+            at[t->name] = {p, t};
+            p += al(b);
+        }
+    }
+    const auto f32 = [&](const std::string& n, int64_t want, const float*& out) -> bool {
+        const auto it = at.find(n);
+        if (it == at.end() || it->second.second->type != 0 || (int64_t) it->second.second->elements() != want) {
+            err = "glm dflash: " + path + ": tensor " + n + " missing or not F32 of " + std::to_string(want);
+            return false;
+        }
+        out = (const float*) it->second.first;
+        return true;
+    };
+    const auto mat = [&](const std::string& n, int n_in, int n_out, GlmDflash::Impl::Mat& out) -> bool {
+        const auto it = at.find(n);
+        if (it == at.end()) {
+            err = "glm dflash: " + path + ": tensor " + n + " missing";
+            return false;
+        }
+        const auto& t = *it->second.second;
+        if (t.shape.size() != 2 || (int) t.shape[0] != n_in || (int) t.shape[1] != n_out || !gf::mv_supported((int) t.type)) {
+            err = "glm dflash: tensor " + n + " is not a served " + std::to_string(n_in) + " x " + std::to_string(n_out);
+            return false;
+        }
+        out.w = it->second.first;
+        out.type = (int) t.type;
+        out.n_in = n_in;
+        out.n_out = n_out;
+        return true;
+    };
+    const auto deq = [&](const std::string& n, int64_t want, std::vector<float>& host) -> bool {
+        const strata::TensorInfo* t = G.find(n);
+        const ggml_type_traits* tt = t ? ggml_get_type_traits((ggml_type) t->type) : nullptr;
+        if (t == nullptr || (int64_t) t->elements() != want || tt == nullptr || tt->to_float == nullptr) {
+            err = "glm dflash: " + path + ": tensor " + n + " missing or not " + std::to_string(want) + " values";
+            return false;
+        }
+        host.resize((size_t) want);
+        tt->to_float(G.tensor_data(*t), host.data(), want);
+        return true;
+    };
+    const int qd = m.n_head * a.k_mla, kvw = a.kv_lora + a.n_rot;
+    if (!mat("fc.weight", m.K * m.E, m.E, m.fc) || !f32("enc.output_norm.weight", m.E, m.enc_norm) ||
+        !f32("output_norm.weight", m.E, m.out_norm))
+        return false;
+    {
+        const auto w1 = at.find("markov_w1.weight");
+        if (w1 == at.end() || w1->second.second->type != GGML_TYPE_Q8_0 || w1->second.second->shape.size() != 2) {
+            err = "glm dflash: " + path + ": markov_w1 missing or not Q8_0";
+            return false;
+        }
+        a.R = (int) w1->second.second->shape[0];
+        m.V = (int) w1->second.second->shape[1];
+        a.w1 = (const uint8_t*) w1->second.first;
+    }
+    if (a.R % 32 || !mat("markov_w2.weight", a.R, m.V, a.w2) ||
+        !mat("joint_proj.weight", m.E + 2 * a.R, 3 * a.R, a.joint) || !f32("joint_proj.bias", 3 * a.R, a.joint_b))
+        return false;
+    if (G.find("conf_proj.weight") != nullptr) {
+        err = "glm dflash: " + path + ": a DSpark confidence head is not run yet";
+        return false;
+    }
+    if (!deq("mask_embd.weight", (int64_t) m.E * std::max(1, a.B - 1), a.mask_rows)) return false;
+    a.L.resize((size_t) m.n_layer);
+    for (int il = 0; il < m.n_layer; ++il) {
+        auto& Ly = a.L[(size_t) il];
+        const std::string P = "blk." + std::to_string(il) + ".";
+        std::vector<float> kb, vb;
+        if (!f32(P + "attn_norm.weight", m.E, Ly.attn_norm) || !f32(P + "ffn_norm.weight", m.E, Ly.ffn_norm) ||
+            !f32(P + "attn_kv_a_norm.weight", a.kv_lora, Ly.kv_norm) || !mat(P + "attn_q.weight", m.E, qd, Ly.q) ||
+            !mat(P + "attn_kv_a_mqa.weight", m.E, kvw, Ly.kv_a) ||
+            !mat(P + "attn_output.weight", m.n_head * a.v_mla, m.E, Ly.o) ||
+            !mat(P + "ffn_gate.weight", m.E, m.n_ff, Ly.gate) || !mat(P + "ffn_up.weight", m.E, m.n_ff, Ly.up) ||
+            !mat(P + "ffn_down.weight", m.n_ff, m.E, Ly.down) ||
+            !deq(P + "attn_k_b.weight", (int64_t) m.n_head * a.kv_lora * a.nope, kb) ||
+            !deq(P + "attn_v_b.weight", (int64_t) m.n_head * a.v_mla * a.kv_lora, vb))
+            return false;
+        if (!ck(cudaMalloc((void**) &Ly.k_b, kb.size() * sizeof(float)), "k_b", err) ||
+            !ck(cudaMalloc((void**) &Ly.v_b, vb.size() * sizeof(float)), "v_b", err) ||
+            !ck(cudaMemcpy(Ly.k_b, kb.data(), kb.size() * sizeof(float), cudaMemcpyHostToDevice), "k_b", err) ||
+            !ck(cudaMemcpy(Ly.v_b, vb.data(), vb.size() * sizeof(float), cudaMemcpyHostToDevice), "v_b", err))
+            return false;
+    }
+    // ---- the ring: per layer the latent and k_pe of each slot; one allocation
+    const size_t rl = (size_t) m.n_layer * m.ring * a.kv_lora, rk = (size_t) m.n_layer * m.ring * a.n_rot;
+    if (!ck(cudaMalloc((void**) &a.ring_lat, (rl + rk) * sizeof(float)), "the ring", err) ||
+        !ck(cudaMalloc((void**) &m.kv_pos, (size_t) m.ring * sizeof(long long)), "the ring's positions", err))
+        return false;
+    a.ring_kpe = a.ring_lat + rl;
+    // ---- the buffers: the injection's (kInjRows) as DFlash2's, the block's B rows
+    const int B = a.B, Rr = kInjRows, KE = m.K * m.E, J = m.E + 2 * a.R;
+    const size_t f4 = sizeof(float);
+    const size_t need = al((size_t) Rr * KE * f4) + al((size_t) Rr * m.q8(KE)) + 2 * al((size_t) Rr * m.E * f4) +
+                        al((size_t) Rr * m.q8(m.E)) + al((size_t) Rr * kvw * f4) + 4 * al((size_t) B * m.E * f4) +
+                        al((size_t) B * m.q8(std::max({m.E, qd, m.n_ff}))) + 3 * al((size_t) B * m.n_ff * f4) +
+                        al((size_t) B * (size_t) m.V * f4) + al((size_t) B * sizeof(int)) + al((size_t) B * f4);
+    if (!ck(cudaMalloc(&m.buf, need), "buffers", err)) return false;
+    m.buf_bytes = need;
+    uint8_t* p = (uint8_t*) m.buf;
+    const auto tf = [&](size_t n) {
+        float* r = (float*) p;
+        p += al(n * f4);
+        return r;
+    };
+    const auto tb = [&](size_t n) {
+        void* r = p;
+        p += al(n);
+        return r;
+    };
+    m.feat = tf((size_t) Rr * KE);
+    m.fq = tb((size_t) Rr * m.q8(KE));
+    m.g = tf((size_t) Rr * m.E);
+    m.gn = tf((size_t) Rr * m.E);
+    m.gq = tb((size_t) Rr * m.q8(m.E));
+    a.kvraw = tf((size_t) Rr * kvw);
+    m.h = tf((size_t) B * m.E);
+    m.x = tf((size_t) B * m.E);
+    m.o = tf((size_t) B * m.E);
+    m.xc = tf((size_t) B * m.E);   // (y: the rows' final norm)
+    m.xq = tb((size_t) B * m.q8(std::max({m.E, qd, m.n_ff})));
+    m.gt = tf((size_t) B * m.n_ff);
+    m.up = tf((size_t) B * m.n_ff);
+    m.act = tf((size_t) B * m.n_ff);
+    m.logits = tf((size_t) B * (size_t) m.V);
+    m.tok = (int*) tb((size_t) B * sizeof(int));
+    m.conf = tf((size_t) B);
+    if ((size_t) (p - (uint8_t*) m.buf) > need) {
+        err = "glm dflash: the buffers overflowed their estimate";
+        return false;
+    }
+    // the block's own: q, q_abs, the anchor's latent / k_pe, the attention's out, the Markov chain's
+    const size_t mneed = al((size_t) B * qd * f4) + al((size_t) B * m.n_head * a.kv_lora * f4) + al((size_t) kvw * f4) +
+                         al((size_t) B * m.n_head * a.v_mla * f4) + al((size_t) a.R * f4) + al((size_t) J * f4) +
+                         al((size_t) 3 * a.R * f4) + al((size_t) a.R * f4) + al((size_t) m.V * f4) +
+                         al(m.q8(J)) + al(m.q8(a.R)) + al(sizeof(int));
+    if (!ck(cudaMalloc(&a.buf, mneed), "the block's buffers", err)) return false;
+    p = (uint8_t*) a.buf;
+    a.q = tf((size_t) B * qd);
+    a.qabs = tf((size_t) B * m.n_head * a.kv_lora);
+    a.anc = tf((size_t) kvw);
+    a.att = tf((size_t) B * m.n_head * a.v_mla);
+    a.state = tf((size_t) a.R);
+    a.jvec = tf((size_t) J);
+    a.jout = tf((size_t) 3 * a.R);
+    a.mk = tf((size_t) a.R);
+    a.bias = tf((size_t) m.V);
+    a.jq = tb(m.q8(J));
+    a.mq = tb(m.q8(a.R));
+    a.prev = (int*) tb(sizeof(int));
+    m.buf_bytes += mneed;
+    if (!ck(cudaHostAlloc((void**) &m.stage, (size_t) m.ring * KE * f4, cudaHostAllocPortable), "the staging", err) ||
+        !ck(cudaHostAlloc((void**) &m.tok_h, (size_t) B * sizeof(int), cudaHostAllocPortable), "pinned", err) ||
+        !ck(cudaHostAlloc((void**) &m.conf_h, (size_t) B * f4, cudaHostAllocPortable), "pinned", err) ||
+        !ck(cudaHostAlloc((void**) &m.emb_h, (size_t) B * m.E * f4, cudaHostAllocPortable), "pinned", err))
+        return false;
+    for (int t = 0; t < B; ++t) m.conf_h[t] = 1.0f;   // (no confidence head: every draft is kept)
+    m.kv_pos_h.assign((size_t) m.ring, -1);
+    m.st_pos.assign((size_t) m.ring, -1);
+    m.st_mask.assign((size_t) m.ring, 0u);
+    m.mask_tok = 0;
+    if (!ck(cudaMemset(m.kv_pos, 0xff, (size_t) m.ring * sizeof(long long)), "ring reset", err)) return false;
+    return true;
+}
+
+static bool dspark_mla_inject(GlmDflash::Impl& m, int64_t lo, int64_t hi, cudaStream_t s, std::string& err) {
+    GlmDflash::Impl::Mla& a = *m.mla;
+    lo = std::max<int64_t>(lo, hi - m.window);
+    const uint32_t full = m.K >= 32 ? 0xffffffffu : (1u << m.K) - 1u;
+    const int KE = m.K * m.E, kvw = a.kv_lora + a.n_rot;
+    cudaSetDevice(m.dev);
+    std::vector<std::pair<int64_t, int64_t>> runs;
+    {
+        std::lock_guard<std::mutex> lk(m.mu);
+        for (int64_t p = lo; p < hi; ++p) {
+            const size_t sl = (size_t) (p % m.ring);
+            if (!(m.st_pos[sl] == p && m.st_mask[sl] == full && m.kv_pos_h[sl] != p)) continue;
+            if (!runs.empty() && runs.back().second == p && runs.back().second - runs.back().first < kInjRows)
+                ++runs.back().second;
+            else
+                runs.push_back({p, p + 1});
+        }
+    }
+    for (const auto& r : runs) {
+        const int64_t p0 = r.first;
+        const int n = (int) (r.second - r.first);
+        for (int i = 0; i < n;) {
+            const size_t sl = (size_t) ((p0 + i) % m.ring);
+            const int len = (int) std::min<int64_t>(n - i, (int64_t) m.ring - (int64_t) sl);
+            if (!ck(cudaMemcpyAsync(m.feat + (size_t) i * KE, m.stage + sl * KE, (size_t) len * KE * sizeof(float),
+                                    cudaMemcpyHostToDevice, s),
+                    "staging upload", err))
+                return false;
+            i += len;
+        }
+        kv_pos_kernel<<<(n + 127) / 128, 128, 0, s>>>(p0, n, m.ring, m.kv_pos);
+        gf::quantize_q8_1(m.feat, m.fq, n * KE, s);
+        if (!mv_cols({m.fc.w, m.fq, xf_for(m.fc.type, m.feat), m.g, nullptr, 1.0f, m.fc.type, KE, m.E}, n, m.q8(KE),
+                     KE, m.E, s)) {
+            err = "glm dflash: fc";
+            return false;
+        }
+        rms_rows_kernel<<<n, 256, 0, s>>>(m.g, m.E, m.enc_norm, m.eps, m.E, m.gn, m.E);
+        gf::quantize_q8_1(m.gn, m.gq, n * m.E, s);
+        for (int il = 0; il < m.n_layer; ++il) {
+            const auto& Ly = a.L[(size_t) il];
+            if (!mv_cols({Ly.kv_a.w, m.gq, xf_for(Ly.kv_a.type, m.gn), a.kvraw, nullptr, 1.0f, Ly.kv_a.type, m.E, kvw}, n,
+                         m.q8(m.E), m.E, kvw, s)) {
+                err = "glm dflash: context kv_a";
+                return false;
+            }
+            mla_kv_kernel<<<n, 256, 0, s>>>(a.kvraw, Ly.kv_norm, m.eps, a.kv_lora, a.n_rot, p0, m.ring,
+                                            a.ring_lat + (size_t) il * m.ring * a.kv_lora,
+                                            a.ring_kpe + (size_t) il * m.ring * a.n_rot, m.rope_base, a.freq_scale,
+                                            a.ext, a.lo, a.hi, a.mscale);
+        }
+        for (int i = 0; i < n; ++i) m.kv_pos_h[(size_t) ((p0 + i) % m.ring)] = p0 + i;
+    }
+    return ck(cudaGetLastError(), "inject", err);
+}
+
+static bool dspark_mla_draft(GlmDflash::Impl& m, int32_t anchor, int64_t n_past, int n_max, float p_min,
+                             const WSlot& head, const uint8_t* emb, int emb_type, cudaStream_t s, std::string& err) {
+    GlmDflash::Impl::Mla& a = *m.mla;
+    (void) p_min;
+    n_max = std::min(n_max, a.B);
+    if (n_max < 1) return true;
+    const int B = n_max, E = m.E, qd = m.n_head * a.k_mla, kvw = a.kv_lora + a.n_rot;
+    cudaSetDevice(m.dev);
+    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) emb_type);
+    if (tt == nullptr || tt->to_float == nullptr || emb == nullptr) {
+        err = "glm dflash: no embedding dequantizer";
+        return false;
+    }
+    if (m.emb_ev == nullptr) cudaEventCreateWithFlags(&m.emb_ev, cudaEventDisableTiming);
+    cudaEventSynchronize(m.emb_ev);
+    tt->to_float(emb + (size_t) anchor * ggml_row_size((ggml_type) emb_type, E), m.emb_h, E);
+    for (int t = 1; t < B; ++t)
+        std::memcpy(m.emb_h + (size_t) t * E, a.mask_rows.data() + (size_t) (t - 1) * E, (size_t) E * sizeof(float));
+    cudaMemcpyAsync(m.h, m.emb_h, (size_t) B * E * sizeof(float), cudaMemcpyHostToDevice, s);
+    cudaEventRecord(m.emb_ev, s);
+    const auto job = [&](const GlmDflash::Impl::Mat& w, const float* x, float* y, int n) {
+        gf::MvJob j{w.w, m.xq, xf_for(w.type, x), y, nullptr, 1.0f, w.type, w.n_in, w.n_out};
+        j.approx = true;
+        j.ncol = n;
+        j.xq_cstride = (int64_t) m.q8(w.n_in);
+        if (j.xf) j.xf_cstride = w.n_in;
+        j.y_cstride = w.n_out;
+        return j;
+    };
+    const int64_t lo = std::max<int64_t>(0, n_past - m.window);
+    const int nk = (int) (n_past - lo) + 1;
+    const size_t smem = ((size_t) nk + a.kv_lora) * sizeof(float);
+    if (smem > 48 * 1024) {   // (a window of ~12K positions; the released draft slides over 2048)
+        err = "glm dflash: a DSpark window of " + std::to_string(nk) + " keys";
+        return false;
+    }
+    const float scale = 1.0f / std::sqrt((float) a.k_mla);
+    for (int il = 0; il < m.n_layer; ++il) {
+        const auto& Ly = a.L[(size_t) il];
+        rms_rows_kernel<<<B, 256, 0, s>>>(m.h, E, Ly.attn_norm, m.eps, E, m.x, E);
+        gf::quantize_q8_1(m.x, m.xq, B * E, s);
+        gf::MvJob jq[2] = {job(Ly.q, m.x, a.q, B), job(Ly.kv_a, m.x, a.kvraw, 1)};
+        if (!gf::mv(jq, 2, s)) { err = "glm dflash: q / kv_a"; return false; }
+        // the anchor row's key at n_past (every row sees it), the rows' q_pe and q_abs
+        mla_kv_kernel<<<1, 256, 0, s>>>(a.kvraw, Ly.kv_norm, m.eps, a.kv_lora, a.n_rot, n_past, 0, a.anc,
+                                        a.anc + a.kv_lora, m.rope_base, a.freq_scale, a.ext, a.lo, a.hi, a.mscale);
+        mla_q_kernel<<<dim3(m.n_head, B), 128, 0, s>>>(a.q, m.n_head, a.k_mla, a.nope, a.n_rot, a.kv_lora, Ly.k_b, n_past,
+                                                        a.qabs, m.rope_base, a.freq_scale, a.ext, a.lo, a.hi, a.mscale);
+        mla_attn_kernel<<<dim3(m.n_head, B), 256, smem, s>>>(
+            a.qabs, a.q, a.ring_lat + (size_t) il * m.ring * a.kv_lora, a.ring_kpe + (size_t) il * m.ring * a.n_rot,
+            m.kv_pos, m.ring, lo, n_past, a.anc, a.anc + a.kv_lora, m.n_head, a.k_mla, a.nope, a.n_rot, a.kv_lora,
+            a.v_mla, Ly.v_b, scale, a.att);
+        gf::quantize_q8_1(a.att, m.xq, B * m.n_head * a.v_mla, s);
+        gf::MvJob jo = job(Ly.o, a.att, m.o, B);
+        if (!gf::mv(&jo, 1, s)) { err = "glm dflash: attn output"; return false; }
+        add_kernel<<<(B * E + 255) / 256, 256, 0, s>>>(m.h, m.o, B * E);
+        rms_rows_kernel<<<B, 256, 0, s>>>(m.h, E, Ly.ffn_norm, m.eps, E, m.x, E);
+        gf::quantize_q8_1(m.x, m.xq, B * E, s);
+        gf::MvJob j2[2] = {job(Ly.gate, m.x, m.gt, B), job(Ly.up, m.x, m.up, B)};
+        if (!gf::mv(j2, 2, s)) { err = "glm dflash: ffn gate / up"; return false; }
+        silu_mul_kernel<<<(B * m.n_ff + 255) / 256, 256, 0, s>>>(m.gt, m.up, B * m.n_ff, m.act);
+        gf::quantize_q8_1(m.act, m.xq, B * m.n_ff, s);
+        gf::MvJob jd = job(Ly.down, m.act, m.o, B);
+        if (!gf::mv(&jd, 1, s)) { err = "glm dflash: ffn down"; return false; }
+        add_kernel<<<(B * E + 255) / 256, 256, 0, s>>>(m.h, m.o, B * E);
+    }
+    // the rows' final norm, the target's head (softcapped), then the Markov chain
+    rms_rows_kernel<<<B, 256, 0, s>>>(m.h, E, m.out_norm, m.eps, E, m.xc, E);
+    gf::quantize_q8_1(m.xc, m.xq, B * E, s);
+    gf::MvJob jh{head.q, m.xq, m.xc, m.logits, nullptr, 1.0f, head.type, E, m.V};
+    if (head.type == 0) jh.w = head.f32;
+    jh.ncol = B;
+    jh.xq_cstride = (int64_t) m.q8(E);
+    jh.xf_cstride = E;
+    jh.y_cstride = m.V;
+    jh.approx = true;
+    if (!gf::mv(&jh, 1, s)) { err = "glm dflash: the head (type " + std::to_string(head.type) + ")"; return false; }
+    if (a.softcap > 0.0f)
+        mla_softcap_kernel<<<(unsigned) (((size_t) B * m.V + 255) / 256), 256, 0, s>>>(m.logits, (size_t) B * m.V, a.softcap);
+    cudaMemsetAsync(a.state, 0, (size_t) a.R * sizeof(float), s);
+    cudaMemcpyAsync(a.prev, &anchor, sizeof(int), cudaMemcpyHostToDevice, s);
+    const int J = E + 2 * a.R;
+    for (int t = 0; t < B; ++t) {
+        markov_in_kernel<<<(J + 255) / 256, 256, 0, s>>>(a.state, a.w1, a.prev, m.xc + (size_t) t * E, a.R, E, a.jvec);
+        gf::quantize_q8_1(a.jvec, a.jq, J, s);
+        gf::MvJob jj{a.joint.w, a.jq, xf_for(a.joint.type, a.jvec), a.jout, nullptr, 1.0f, a.joint.type, J, 3 * a.R};
+        if (!gf::mv(&jj, 1, s)) { err = "glm dflash: joint_proj"; return false; }
+        markov_gate_kernel<<<(a.R + 255) / 256, 256, 0, s>>>(a.jout, a.joint_b, a.R, a.state, a.mk);
+        gf::quantize_q8_1(a.mk, a.mq, a.R, s);
+        gf::MvJob jw{a.w2.w, a.mq, xf_for(a.w2.type, a.mk), a.bias, nullptr, 1.0f, a.w2.type, a.R, m.V};
+        if (!gf::mv(&jw, 1, s)) { err = "glm dflash: markov_w2"; return false; }
+        float* row = m.logits + (size_t) t * m.V;
+        add_rows_kernel<<<(unsigned) ((m.V + 255) / 256), 256, 0, s>>>(row, a.bias, (size_t) m.V);
+        gf::argmax(row, m.V, a.prev, s);
+        cudaMemcpyAsync(m.tok + t, a.prev, sizeof(int), cudaMemcpyDeviceToDevice, s);
+    }
+    cudaMemcpyAsync(m.tok_h, m.tok, (size_t) B * sizeof(int), cudaMemcpyDeviceToHost, s);
+    m.pend_s = s;
+    m.pend_n = B;
+    m.pend_p_min = 0.0f;
+    if (!ck(cudaGetLastError(), "draft", err)) return false;
+    return true;
+}
+
 bool GlmDflash::inject(int64_t lo, int64_t hi, cudaStream_t s, std::string& err) {
     Impl& m = *d_;
     if (hi <= lo) return true;
+    if (m.mla) return dspark_mla_inject(m, lo, hi, s, err);
     lo = std::max<int64_t>(lo, hi - m.window);
     const uint32_t full = m.K >= 32 ? 0xffffffffu : (1u << m.K) - 1u;
     const int KE = m.K * m.E, kvd = m.n_kv * kHeadDim;
@@ -1205,6 +1851,7 @@ bool GlmDflash::draft_start(int32_t anchor, int64_t n_past, int n_max, float p_m
                             const uint8_t* emb, int emb_type, cudaStream_t s, std::string& err) {
     Impl& m = *d_;
     m.pend_n = 0;
+    if (m.mla) return dspark_mla_draft(m, anchor, n_past, n_max, p_min, head, emb, emb_type, s, err);
     n_max = std::min(n_max, m.block - 1);
     if (n_max < 1) return true;
     const int B = n_max + 1, E = m.E, qd = m.n_head * kHeadDim, kvd = m.n_kv * kHeadDim, cd = m.cdyn;
@@ -1617,7 +2264,8 @@ bool Glm5Model::dflash_bind(std::string& err) {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         m->cap_k_.assign((size_t) g_.n_layers + 1, -1);
         for (size_t k = 0; k < tl.size(); ++k)
-            if (tl[k] >= m->l0_ && tl[k] < m->l1_) m->cap_k_[(size_t) tl[k]] = (int) k;
+            if (tl[k] >= m->l0_ && (tl[k] < m->l1_ || (tl[k] == g_.n_layers && m->l1_ == g_.n_layers)))
+                m->cap_k_[(size_t) tl[k]] = (int) k;   // (layer n_layers: the final residual, the last part's)
         m->cap_d_ = D;
         cudaSetDevice(m->dev_);
         if (m->fast_->cap == nullptr) {
