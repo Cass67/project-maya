@@ -493,6 +493,73 @@ __global__ void rope_norm_kernel(float* __restrict__ x, int n_rot, int stride, i
     xh[1] = x0 * sn + x1 * c;
 }
 
+// The same with YaRN and freq_factors, as ggml-cpu's rope cache (ref/ml4.py rope_yarn): theta / ff[i] extrapolated,
+// freq_scale x it interpolated, mixed by the ramp over [lo, hi] x ext; cos/sin x mscale.
+struct RopeYarn {
+    float base, freq_scale, ext, lo, hi, mscale;
+    const float* ff;   // n_rot/2 divisors, or nullptr
+};
+__global__ void rope_yarn_kernel(float* __restrict__ x, int n_rot, int stride, int n_head, int pos, RopeYarn r) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_head * (n_rot / 2)) return;
+    const int h = idx / (n_rot / 2);
+    const int i = idx % (n_rot / 2);
+    const float theta_scale = powf(r.base, -2.0f / (float) n_rot);
+    float theta = (float) pos;
+    for (int k = 0; k < i; ++k) theta *= theta_scale;
+    const float t_ex = theta / (r.ff ? r.ff[i] : 1.0f);
+    float t = r.freq_scale * t_ex;
+    if (r.ext != 0.0f) {
+        const float y = ((float) i - r.lo) / fmaxf(0.001f, r.hi - r.lo);
+        const float mix = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * r.ext;
+        t = t * (1.0f - mix) + t_ex * mix;
+    }
+    float* xh = x + (size_t) stride * h + 2 * i;
+    const float c = cosf(t) * r.mscale, sn = sinf(t) * r.mscale;
+    const float x0 = xh[0], x1 = xh[1];
+    xh[0] = x0 * c - x1 * sn;
+    xh[1] = x0 * sn + x1 * c;
+}
+
+// SSMax: head h's first `width` floats (at x + stride*h) times s[h] * lp + b[h], lp = log(pos + 1)
+__global__ void ssmax_kernel(float* __restrict__ x, int width, int stride, int n_head, const float* __restrict__ s,
+                             const float* __restrict__ b, float lp) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_head * width) return;
+    const int h = idx / width;
+    x[(size_t) stride * h + idx % width] *= lp * s[h] + b[h];
+}
+
+// mistral-large4's router for one token (build_moe_ffn, softmax gating): softmax over n_expert, the top k by prob
+// (the lower id on a tie), those probs renormalized (clamp 2^-14) x scale.  One thread: n_expert is 128.
+__global__ void router_softmax_kernel(const float* __restrict__ logits, int n_expert, int k, float scale, int norm,
+                                      int* __restrict__ ids, float* __restrict__ w) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    float mx = -INFINITY;
+    for (int e = 0; e < n_expert; ++e) mx = fmaxf(mx, logits[e]);
+    float den = 0.0f;
+    for (int e = 0; e < n_expert; ++e) den += expf(logits[e] - mx);
+    float sum = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        int best = -1;
+        for (int e = 0; e < n_expert; ++e) {
+            bool taken = false;
+            for (int q = 0; q < j; ++q) taken |= ids[q] == e;
+            if (!taken && (best < 0 || logits[e] > logits[best])) best = e;
+        }
+        ids[j] = best;
+        w[j] = expf(logits[best] - mx) / den;
+        sum += w[j];
+    }
+    const float inv = norm ? 1.0f / fmaxf(sum, 6.103515625e-5f) : 1.0f;
+    for (int j = 0; j < k; ++j) w[j] *= inv * scale;
+}
+
+__global__ void softcap_kernel(float* __restrict__ x, int n, float cap) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = tanhf(x[i] / cap) * cap;
+}
+
 int blocks(int n) { return (n + GM_THREADS - 1) / GM_THREADS; }
 
 __global__ void bias_apply_kernel(float* __restrict__ y, const float* __restrict__ bias, float alpha,
@@ -557,6 +624,62 @@ static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src,
 
 // ================================ geometry ================================
 
+// mistral-large4: what differs from glm-dsa (ref/ml4.py::Ml4Config): the per-layer rope / KV-source arrays, YaRN
+// (ggml_rope_yarn_corr_dims; attn_factor as llama-context.cpp sets it, which rope_yarn's magnitude multiplies back),
+// the softcap.  q_lora is 0 (the q projection is attn_q).
+static bool ml4_from_gguf(const strata::GgufFile& g, const std::string& p, Glm5Geometry& out, std::string& err) {
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        return v != nullptr && v->is_num() ? v->num() : def;
+    };
+    const auto arr = [&](const std::string& key, std::vector<int>& dst, int fill_iota) {
+        dst.assign((size_t) out.n_layers, 1);
+        if (fill_iota)
+            for (int i = 0; i < out.n_layers; ++i) dst[(size_t) i] = i;
+        strata::MetaValue v;   // (get_full: metadata() keeps 64 items of an array, ML4 has 72 layers)
+        if (g.get_full(p + key, v) && v.type == strata::MetaType::ARRAY && v.items.size() >= (size_t) out.n_layers)
+            for (int i = 0; i < out.n_layers; ++i) dst[(size_t) i] = (int) v.items[(size_t) i].u;
+    };
+    out.q_lora = (int) num("attention.q_lora_rank", 0);
+    if (out.q_lora != 0) {
+        err = "glm5_model: mistral-large4 with a q_lora is not implemented";
+        return false;
+    }
+    arr("attention.rope_pattern", out.rope_l, 0);
+    arr("attention.kv_source_map", out.kv_src, 1);
+    for (int il = 0; il < out.n_layers; ++il) {
+        const int s = out.kv_src[(size_t) il];
+        if (s > il || s < 0 || out.kv_src[(size_t) s] != s || out.rope_l[(size_t) s] != out.rope_l[(size_t) il]) {
+            err = "glm5_model: mistral-large4 layer " + std::to_string(il) + " has an invalid KV source " +
+                  std::to_string(s);
+            return false;
+        }
+    }
+    out.softcap = (float) num("final_logit_softcapping", 0.0);
+    const auto* st = g.get(p + "rope.scaling.type");
+    const double factor = num("rope.scaling.factor", 1.0);
+    if (st != nullptr && st->s == "yarn" && factor != 1.0) {
+        out.freq_scale = (float) (1.0 / factor);
+        out.yarn_ext = 1.0f;
+        const int n_orig = (int) num("rope.scaling.original_context_length", num("context_length", 1048576));
+        const auto corr = [&](float beta) {
+            return out.n_rot * logf((float) n_orig / (beta * 2 * (float) M_PI)) / (2 * logf(out.rope_base));
+        };
+        out.yarn_lo = std::max(0.0f, floorf(corr((float) num("rope.scaling.yarn_beta_fast", 32.0))));
+        out.yarn_hi = std::min((float) (out.n_rot - 1), ceilf(corr((float) num("rope.scaling.yarn_beta_slow", 1.0))));
+        const float f = (float) factor;
+        const auto gm = [&](float m) { return f <= 1.0f ? 1.0f : 0.1f * m * logf(f) + 1.0f; };
+        const float log_mul = (float) num("rope.scaling.yarn_log_multiplier", 0.0);
+        float attn = log_mul != 0.0f ? gm(1.0f) / gm(log_mul) : gm(1.0f);
+        attn *= 1.0f / (1.0f + 0.1f * logf(f));
+        out.yarn_mscale = attn * (1.0f + 0.1f * logf(1.0f / out.freq_scale));
+    } else if (st != nullptr && st->s != "none" && factor != 1.0) {
+        err = "glm5_model: mistral-large4 rope scaling '" + st->s + "' is not implemented (yarn only)";
+        return false;
+    }
+    return true;
+}
+
 // glm-dsa (GLM-5.3): what differs from glm5-next, read after the shared keys (mirrors
 // ref/glm_dsa.py::GlmDsaConfig key for key)
 static bool dsa_from_gguf(const strata::GgufFile& g, const std::string& p, Glm5Geometry& out, std::string& err) {
@@ -565,9 +688,9 @@ static bool dsa_from_gguf(const strata::GgufFile& g, const std::string& p, Glm5G
         return v != nullptr && v->is_num() ? v->num() : def;
     };
     out.n_rot = (int) num("rope.dimension_count", 64);
-    out.rope_base = (float) num("rope.freq_base", 8000000.0);
+    out.rope_base = (float) num("rope.freq_base", out.ml4 ? 10000.0 : 8000000.0);
     out.qk_nope = out.qk_nope - out.n_rot;   // key_length_mla is the whole head: [nope | rope]
-    out.idx_ln_eps = (float) num("attention.layer_norm_epsilon", 0.0);
+    out.idx_ln_eps = (float) num("attention.layer_norm_epsilon", out.ml4 ? 1e-6 : 0.0);
     out.idx_kpool = 1;                        // the indexer scores tokens
     out.idx_select_tail = 0;
     out.hc = 1;                               // a plain residual
@@ -577,9 +700,11 @@ static bool dsa_from_gguf(const strata::GgufFile& g, const std::string& p, Glm5G
     // the indexer types: the GGUF's array, else llama.cpp's fallback (glm-dsa.cpp): GLM 5 / 5.1 (context
     // below 1M) index every layer, 5.2+ layers 0, 1 and every 4th from 2
     out.indexer_full.assign((size_t) out.n_layers, 1);
-    const auto* types = g.get(p + "attention.indexer.types");
-    if (types != nullptr && types->type == strata::MetaType::ARRAY && types->items.size() >= (size_t) out.n_layers) {
-        for (int i = 0; i < out.n_layers; ++i) out.indexer_full[(size_t) i] = (int) types->items[(size_t) i].u;
+    // (get_full: metadata() keeps a 64-item sample of an array; a 72- or 79-layer model has more)
+    strata::MetaValue types;
+    if (g.get_full(p + "attention.indexer.types", types) && types.type == strata::MetaType::ARRAY &&
+        types.items.size() >= (size_t) out.n_layers) {
+        for (int i = 0; i < out.n_layers; ++i) out.indexer_full[(size_t) i] = (int) types.items[(size_t) i].u;
     } else if (num("context_length", 1048576) >= 1048576) {
         for (int i = 2; i < out.n_layers; ++i) out.indexer_full[(size_t) i] = (i - 2) % 4 == 0;
     }
@@ -587,7 +712,9 @@ static bool dsa_from_gguf(const strata::GgufFile& g, const std::string& p, Glm5G
         err = "glm5_model: glm-dsa layer 0 must run a full indexer (a shared one has nothing to reuse)";
         return false;
     }
-    if (const auto* v = g.get(p + "rope.scaling.factor"); v != nullptr && v->is_num() && v->num() != 1.0) {
+    if (out.ml4 && !ml4_from_gguf(g, p, out, err)) return false;
+    if (const auto* v = g.get(p + "rope.scaling.factor");
+        !out.ml4 && v != nullptr && v->is_num() && v->num() != 1.0) {
         err = "glm5_model: glm-dsa rope scaling (YaRN) is not implemented; GLM-5.3 ships without it";
         return false;
     }
@@ -600,8 +727,9 @@ static bool dsa_from_gguf(const strata::GgufFile& g, const std::string& p, Glm5G
         err = "glm5_model: glm-dsa rope dims " + std::to_string(out.n_rot) + " do not fit the heads";
         return false;
     }
-    if ((int) num("expert_gating_func", 2) != 2) {
-        err = "glm5_model: glm-dsa routes with sigmoid gating (expert_gating_func 2)";
+    if ((int) num("expert_gating_func", 2) != (out.ml4 ? 1 : 2)) {
+        err = out.ml4 ? "glm5_model: mistral-large4 routes with softmax gating (expert_gating_func 1)"
+                      : "glm5_model: glm-dsa routes with sigmoid gating (expert_gating_func 2)";
         return false;
     }
     return true;
@@ -611,8 +739,10 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here; "glm-dsa" is
     // GLM-5.3 itself (the 744B), which shares the MLA/DSA/MoE machinery
-    out.dsa = g.get("glm-dsa.block_count") != nullptr;
-    const std::string p = out.dsa ? "glm-dsa." : g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
+    out.ml4 = g.get("mistral-large4.block_count") != nullptr;
+    out.dsa = out.ml4 || g.get("glm-dsa.block_count") != nullptr;
+    const std::string p = out.ml4 ? "mistral-large4." : out.dsa ? "glm-dsa."
+                          : g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
     const auto num = [&](const std::string& key, double def, bool& ok) -> double {
         const auto* v = g.get(p + key);
         if (!v) return def;
@@ -882,6 +1012,12 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;
             kda_conv_[(size_t) il] = floats;
             floats += (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
+        } else if (g_.dsa && g_.kv_of(il) != il) {
+            // mistral-large4: a layer reading another's latent (and k_pe) holds none of its own
+            dsa_lat_[(size_t) il] = dsa_lat_[(size_t) g_.kv_of(il)];
+            dsa_kpe_[(size_t) il] = dsa_kpe_[(size_t) g_.kv_of(il)];
+            dsa_pool_[(size_t) il] = floats;
+            floats += (int64_t) g_.idx_key * max_ctx;
         } else if (g_.dsa) {
             // glm-dsa: the latent, its k_pe, and the roped indexer key of every token (a pool IS a token)
             dsa_lat_[(size_t) il] = floats;
@@ -930,7 +1066,7 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
     sc_scan = take(g_.d_inner());
     sc_g2 = take(g_.d_inner());
     sc_gated = take(g_.d_inner());
-    sc_qr = take(g_.q_lora);
+    sc_qr = take(g_.ml4 ? g_.n_embd : g_.q_lora);   // (mistral-large4: the indexer q norm of x)
     sc_kv = take(g_.kv_lora + g_.n_rot);
     sc_q = take((int64_t) g_.n_head * g_.k_mla());
     sc_qabs = take((int64_t) g_.kv_lora * g_.n_head);
@@ -2398,31 +2534,64 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
         cb_dump("attn_norm-" + L, A + sc_x, g.n_embd);
 
         if (g.dsa) {
-            // ---- the glm-dsa mixer (ref/glm_dsa.py GlmDsa.attention): roped MLA over the indexer's selection
+            // ---- the glm-dsa mixer (ref/glm_dsa.py GlmDsa.attention): roped MLA over the indexer's selection;
+            // mistral-large4 (ref/ml4.py Ml4.attention) as noted
             const int pos = (int) p;
-            GM_CHECK(gm_gemv(ws_("attn_q_a.weight"), A + sc_x, nullptr, 1.0f, A + sc_qr, g.q_lora, g.n_embd), err);
-            rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_qr, W("attn_q_a_norm.weight"), A + sc_qr, g.q_lora, 1,
-                                               g.norm_eps);
-            // kv_a_mqa -> [latent | k_pe]: the latent normed, k_pe roped (NOT normed)
-            GM_CHECK(gm_gemv(ws_("attn_kv_a_mqa.weight"), A + sc_x, nullptr, 1.0f, A + sc_kv, g.kv_lora + g.n_rot,
-                             g.n_embd), err);
-            rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_kv, W("attn_kv_a_norm.weight"), A + sc_kv, g.kv_lora, 1,
-                                               g.norm_eps);
-            rope_norm_kernel<<<blocks(g.n_rot / 2), GM_THREADS>>>(A + sc_kv + g.kv_lora, g.n_rot, g.n_rot, 1, pos,
-                                                                  g.rope_base);
+            const bool rope = g.has_rope(il);
+            const int n_rot = rope ? g.n_rot : 0, qn = g.qk_nope_l(il);
+            const RopeYarn ry{g.rope_base, g.freq_scale, g.yarn_ext, g.yarn_lo, g.yarn_hi, g.yarn_mscale,
+                              g.ml4 && w_.count("rope_freqs.weight") ? w_.at("rope_freqs.weight") : nullptr};
+            const auto rope_heads = [&](float* x, int stride, int n_head) {
+                if (g.ml4)
+                    rope_yarn_kernel<<<blocks(n_head * g.n_rot / 2), GM_THREADS>>>(x, g.n_rot, stride, n_head, pos, ry);
+                else
+                    rope_norm_kernel<<<blocks(n_head * g.n_rot / 2), GM_THREADS>>>(x, g.n_rot, stride, n_head, pos,
+                                                                                  g.rope_base);
+            };
+            // SSMax's log(pos + 1) as llama.cpp feeds it: 1 + log in double, stored f32, then - 1 in f32
+            const float lp = (float) (std::log((double) pos + 1.0) + 1.0) - 1.0f;
+            if (g.ml4) {   // no q_lora: q straight from x
+                GM_CHECK(gm_gemv(ws_("attn_q.weight"), A + sc_x, nullptr, 1.0f, A + sc_q, g.n_head * g.k_mla(),
+                                 g.n_embd), err);
+            } else {
+                GM_CHECK(gm_gemv(ws_("attn_q_a.weight"), A + sc_x, nullptr, 1.0f, A + sc_qr, g.q_lora, g.n_embd), err);
+                rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_qr, W("attn_q_a_norm.weight"), A + sc_qr, g.q_lora, 1,
+                                                   g.norm_eps);
+            }
+            // kv_a_mqa -> [latent | k_pe]: the latent normed, k_pe roped (NOT normed); a mistral-large4 layer with
+            // a KV source reads that layer's (dsa_lat_ / dsa_kpe_ point there) and writes nothing
             float* lat = S + dsa_lat_[(size_t) il];
             float* kpe = S + dsa_kpe_[(size_t) il];
-            GM_CHECK(cudaMemcpy(lat + (int64_t) g.kv_lora * p, A + sc_kv, (size_t) g.kv_lora * sizeof(float),
-                                cudaMemcpyDeviceToDevice), err);
-            GM_CHECK(cudaMemcpy(kpe + (int64_t) g.n_rot * p, A + sc_kv + g.kv_lora, (size_t) g.n_rot * sizeof(float),
-                                cudaMemcpyDeviceToDevice), err);
-            // q_b -> heads of [nope | rope]: the rope part roped in place, the nope part absorbed through wk_b
-            GM_CHECK(gm_gemv(ws_("attn_q_b.weight"), A + sc_qr, nullptr, 1.0f, A + sc_q, g.n_head * g.k_mla(),
-                             g.q_lora), err);
-            rope_norm_kernel<<<blocks(g.n_head * g.n_rot / 2), GM_THREADS>>>(A + sc_q + g.qk_nope, g.n_rot, g.k_mla(),
-                                                                             g.n_head, pos, g.rope_base);
+            if (g.kv_of(il) == il) {
+                GM_CHECK(gm_gemv(ws_("attn_kv_a_mqa.weight"), A + sc_x, nullptr, 1.0f, A + sc_kv, g.kv_lora + n_rot,
+                                 g.n_embd), err);
+                rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_kv, W("attn_kv_a_norm.weight"), A + sc_kv, g.kv_lora, 1,
+                                                   g.norm_eps);
+                GM_CHECK(cudaMemcpy(lat + (int64_t) g.kv_lora * p, A + sc_kv, (size_t) g.kv_lora * sizeof(float),
+                                    cudaMemcpyDeviceToDevice), err);
+                if (rope) {
+                    rope_heads(A + sc_kv + g.kv_lora, g.n_rot, 1);
+                    GM_CHECK(cudaMemcpy(kpe + (int64_t) g.n_rot * p, A + sc_kv + g.kv_lora,
+                                        (size_t) g.n_rot * sizeof(float), cudaMemcpyDeviceToDevice), err);
+                }
+            }
+            // q heads of [nope | rope]: the rope part roped in place, the nope part absorbed through wk_b (a NoPE
+            // layer absorbs the whole head)
+            if (!g.ml4)
+                GM_CHECK(gm_gemv(ws_("attn_q_b.weight"), A + sc_qr, nullptr, 1.0f, A + sc_q, g.n_head * g.k_mla(),
+                                 g.q_lora), err);
+            if (rope) rope_heads(A + sc_q + qn, g.k_mla(), g.n_head);
             q_absorb_kernel<<<blocks((int64_t) g.kv_lora * g.n_head), GM_THREADS>>>(
-                W("attn_k_b.weight"), A + sc_q, A + sc_qabs, g.qk_nope, g.kv_lora, g.n_head, 1, g.k_mla());
+                W("attn_k_b.weight"), A + sc_q, A + sc_qabs, qn, g.kv_lora, g.n_head, 1, g.k_mla());
+            if (g.ml4) {   // SSMax on the whole q: the absorbed part and the roped tail
+                ssmax_kernel<<<blocks(g.n_head * g.kv_lora), GM_THREADS>>>(A + sc_qabs, g.kv_lora, g.kv_lora, g.n_head,
+                                                                           W("attn_ssmax.weight"),
+                                                                           W("attn_ssmax.bias"), lp);
+                if (rope)
+                    ssmax_kernel<<<blocks(g.n_head * g.n_rot), GM_THREADS>>>(A + sc_q + qn, g.n_rot, g.k_mla(),
+                                                                             g.n_head, W("attn_ssmax.weight"),
+                                                                             W("attn_ssmax.bias"), lp);
+            }
 
             if (g.indexer_full[(size_t) il]) {
                 // the token indexer: the roped key IS the pool (kpool 1); score every visible token, keep top_k.
@@ -2431,15 +2600,23 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                                  g.n_embd), err);
                 layer_norm_kernel<<<1, GM_THREADS>>>(A + sc_tmp, W("indexer.k_norm.weight"), W("indexer.k_norm.bias"),
                                                      A + sc_tmp, g.idx_key, 1, g.idx_ln_eps);
-                rope_norm_kernel<<<blocks(g.n_rot / 2), GM_THREADS>>>(A + sc_tmp, g.n_rot, g.idx_key, 1, pos,
-                                                                      g.rope_base);
+                if (rope) rope_heads(A + sc_tmp, g.idx_key, 1);
                 float* ikc = S + dsa_pool_[(size_t) il];
                 GM_CHECK(cudaMemcpy(ikc + (int64_t) g.idx_key * p, A + sc_tmp, (size_t) g.idx_key * sizeof(float),
                                     cudaMemcpyDeviceToDevice), err);
-                GM_CHECK(gm_gemv(ws_("indexer.attn_q_b.weight"), A + sc_qr, nullptr, 1.0f, A + sc_iq,
-                                 g.idx_heads * g.idx_key, g.q_lora), err);
-                rope_norm_kernel<<<blocks(g.idx_heads * g.n_rot / 2), GM_THREADS>>>(A + sc_iq, g.n_rot, g.idx_key,
-                                                                                    g.idx_heads, pos, g.rope_base);
+                if (g.ml4) {   // the indexer q from layer_norm(x), SSMax'd before its rope
+                    layer_norm_kernel<<<1, GM_THREADS>>>(A + sc_x, W("indexer.q_norm.weight"), W("indexer.q_norm.bias"),
+                                                         A + sc_qr, g.n_embd, 1, g.idx_ln_eps);
+                    GM_CHECK(gm_gemv(ws_("indexer.attn_q_b.weight"), A + sc_qr, nullptr, 1.0f, A + sc_iq,
+                                     g.idx_heads * g.idx_key, g.n_embd), err);
+                    ssmax_kernel<<<blocks(g.idx_heads * g.idx_key), GM_THREADS>>>(
+                        A + sc_iq, g.idx_key, g.idx_key, g.idx_heads, W("indexer.ssmax.weight"),
+                        W("indexer.ssmax.bias"), lp);
+                } else {
+                    GM_CHECK(gm_gemv(ws_("indexer.attn_q_b.weight"), A + sc_qr, nullptr, 1.0f, A + sc_iq,
+                                     g.idx_heads * g.idx_key, g.q_lora), err);
+                }
+                if (rope) rope_heads(A + sc_iq, g.idx_key, g.idx_heads);
                 GM_CHECK(gm_gemv(ws_("indexer.proj.weight"), A + sc_x, nullptr, prescale, A + sc_iw, g.idx_heads,
                                  g.n_embd), err);
                 strata::kernels::glm_dsa_score(A + sc_iq, ikc, A + sc_iw, g.idx_key, g.idx_heads, 1, pos + 1,
@@ -2452,9 +2629,14 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                 err = "glm5_model: glm-dsa layer " + L + " shares an indexer selection this part never made";
                 return false;
             }
-            strata::kernels::glm_mla_attention_pe(A + sc_qabs, A + sc_q + g.qk_nope, g.k_mla(), lat, kpe, g.n_rot,
-                                                  (const int*) (A + sc_cells), W("attn_v_b.weight"), g.kv_lora,
-                                                  g.n_head, g.v_head, g.qk_nope, 1, dsa_n_sel, A + sc_attn, nullptr);
+            if (rope)
+                strata::kernels::glm_mla_attention_pe(A + sc_qabs, A + sc_q + qn, g.k_mla(), lat, kpe, g.n_rot,
+                                                      (const int*) (A + sc_cells), W("attn_v_b.weight"), g.kv_lora,
+                                                      g.n_head, g.v_head, qn, 1, dsa_n_sel, A + sc_attn, nullptr);
+            else   // a NoPE layer: the latent score alone, scaled by the whole head (1/sqrt(qn))
+                strata::kernels::glm_mla_attention(A + sc_qabs, lat, (const int*) (A + sc_cells), W("attn_v_b.weight"),
+                                                   g.kv_lora, g.n_head, g.v_head, qn, 1, dsa_n_sel, A + sc_attn,
+                                                   nullptr);
             cb_dump("kqv_out-" + L, A + sc_attn, (int64_t) g.v_head * g.n_head);
             GM_CHECK(gm_gemv(ws_("attn_output.weight"), A + sc_attn, nullptr, 1.0f, A + sc_mixer, g.n_embd,
                              (int64_t) g.n_head * g.v_head), err);
@@ -2591,8 +2773,12 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
             GM_CHECK(gm_gemv(ws_("ffn_gate_inp.weight"), A + sc_x, nullptr, 1.0f,
                                                                  A + sc_tmp, g.n_expert, g.n_embd), err);
             cb_dump("glm_moe_logits-" + L, A + sc_tmp, g.n_expert);
-            strata::kernels::router_sigmoid(A + sc_tmp, W("exp_probs_b.bias"), 1, g.n_expert, g.n_exp_used,
-                                            g.w_scale, g.norm_w != 0, (int*) (A + sc_ids), A + sc_rw, nullptr);
+            if (g.ml4)
+                router_softmax_kernel<<<1, 1>>>(A + sc_tmp, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w,
+                                                (int*) (A + sc_ids), A + sc_rw);
+            else
+                strata::kernels::router_sigmoid(A + sc_tmp, W("exp_probs_b.bias"), 1, g.n_expert, g.n_exp_used,
+                                                g.w_scale, g.norm_w != 0, (int*) (A + sc_ids), A + sc_rw, nullptr);
             cb_dump("glm_moe_topk-" + L, A + sc_ids, g.n_exp_used);
             cb_dump("glm_moe_rw-" + L, A + sc_rw, g.n_exp_used);
             std::vector<int> ids((size_t) g.n_exp_used);
@@ -2682,6 +2868,7 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                                            g.norm_eps);
         GM_CHECK(gm_gemv(ws_map_.at("output.weight"), A + sc_head, nullptr, 1.0f,
                                      A + sc_logits, g.n_vocab, g.n_embd), err);
+        if (g.softcap > 0.0f) softcap_kernel<<<blocks(g.n_vocab), GM_THREADS>>>(A + sc_logits, g.n_vocab, g.softcap);
     }
     return true;
 }
@@ -3741,7 +3928,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     sc_scan = take(g_.d_inner());
     sc_g2 = take(g_.d_inner());
     sc_gated = take(g_.d_inner());
-    sc_qr = take(g_.q_lora);
+    sc_qr = take(g_.ml4 ? g_.n_embd : g_.q_lora);   // (mistral-large4: the indexer q norm of x)
     sc_kv = take(g_.kv_lora + g_.n_rot);
     sc_q = take((int64_t) g_.n_head * g_.k_mla());
     sc_qabs = take((int64_t) g_.kv_lora * g_.n_head);

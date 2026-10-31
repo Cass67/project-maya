@@ -91,8 +91,19 @@ struct Glm5Geometry {
     int n_rot = 0;
     float rope_base = 10000.0f;
     float idx_ln_eps = 1e-5f;
+    // mistral-large4 (Mistral Large 4, ref/ml4.py) rides the glm-dsa path (dsa set too): no q_lora (q = attn_q x,
+    // the indexer q from layer_norm(x)), NoPE layers (rope_l 0: the whole head absorbed, no k_pe), layers reading
+    // another layer's latent (kv_src), SSMax on q and the indexer q, YaRN with LeRoPE rope_freqs, a softmax router
+    // and the logit softcap.  yarn_*: ggml_rope_yarn_corr_dims and the cos/sin magnitude (attn_factor x mscale).
+    bool ml4 = false;
+    std::vector<int> rope_l, kv_src;
+    float freq_scale = 1.0f, yarn_ext = 0.0f, yarn_lo = 0.0f, yarn_hi = 0.0f, yarn_mscale = 1.0f;
+    float softcap = 0.0f;
 
     int k_mla() const { return qk_nope + n_rot; }      // a q_b head's width: [nope | rope]
+    bool has_rope(int il) const { return !ml4 || rope_l[(size_t) il] != 0; }
+    int qk_nope_l(int il) const { return has_rope(il) ? qk_nope : k_mla(); }   // the absorbed part of a head
+    int kv_of(int il) const { return ml4 ? kv_src[(size_t) il] : il; }
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }

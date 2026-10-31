@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
         const float* col = oracle.data() + V * (t - 1);
         const double d = max_abs(lg.data(), col, V);
         worst = std::max(worst, d);
-        require(d < 2e-3, "prefix " + std::to_string(t) + " diverges from ref/glm_dsa.py (" + std::to_string(d) + ")");
+        require(d < 2e-3, "prefix " + std::to_string(t) + " diverges from the oracle (" + std::to_string(d) + ")");
         require(argmax(lg.data(), V) == argmax(col, V), "prefix " + std::to_string(t) + " argmax differs");
         last = std::move(lg);
     }
@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
     const double d_stream = max_abs(streamed.data(), last.data(), V);
     require(d_stream < 1e-5, "streamed and batched logits differ (" + std::to_string(d_stream) + ")");
 
-    std::printf("glm_dsa_model_test: %zu prefixes match ref/glm_dsa.py (max |dlogit| %.2e), streaming exact (%.1e)\n",
+    std::printf("glm_dsa_model_test: %zu prefixes match the oracle (max |dlogit| %.2e), streaming exact (%.1e)\n",
                 T, worst, d_stream);
     return 0;
 }
