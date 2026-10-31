@@ -258,9 +258,23 @@ static bool is_absorbed_mla(const std::string& name) {
     return ends(".attn_k_b.weight") || ends(".attn_v_b.weight");
 }
 
+// glm-dsa's fast path: the rows its kernels read as BF16 copies (load_pack's dsa16), whatever the pack stores
+static bool dsa_bf16_row(const std::string& name) {
+    for (const char* suf : {".ffn_gate_inp.weight", ".indexer.proj.weight", ".indexer.attn_k.weight",
+                            ".indexer.attn_q_b.weight", ".attn_k_b.weight", ".attn_v_b.weight"}) {
+        const size_t n = std::strlen(suf);
+        if (name.size() >= n && name.compare(name.size() - n, n, suf) == 0) return true;
+    }
+    return false;
+}
+
 static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
-                              std::string* how = nullptr) {
+                              std::string* how = nullptr, bool dsa = false) {
     if (fast && name == "token_embd.weight") return 0;
+    if (fast && dsa && dsa_bf16_row(name)) {   // (a Q8_0 one: its BF16 copy is twice the native bytes)
+        if (how) *how = " bf16";
+        return ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
+    }
     if (fast && kind == "4" && t->elements() >= 65536) {
         if (how) *how = " bf16";
         return ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
@@ -871,6 +885,7 @@ Glm5Model::~Glm5Model() {
     ckpt_join();
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
+    if (kvm_writer_ && kvm_host_ != nullptr) cudaFreeHost(kvm_host_);
     if (!seq_.empty()) {   // STRATA_GLM_SEQS: sequence 0 goes back to the members (freed below), the others here
         seq_bind(0);
         for (size_t s = 0; s < seq_.size(); ++s) {
@@ -1596,6 +1611,33 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         }
     }
     }
+    // mistral-large4: each part mirroring an earlier part's KV source gets that writer's pinned record rows
+    for (Glm5Model* r = this; r != nullptr; r = r->split_next_.get()) {
+        if (r->kvm_src_ < 0 || r->kvm_writer_) continue;
+        Glm5Model* w = this;
+        while (w != nullptr && !(w->l0_ <= r->kvm_src_ && r->kvm_src_ < w->l1_)) w = w->split_next_.get();
+        if (w == nullptr || w->dsa_rec_ <= 0) {
+            err = "glm split: no part holds mistral-large4's KV source layer " + std::to_string(r->kvm_src_);
+            split_next_.reset();
+            return false;
+        }
+        if (w->kvm_host_ == nullptr) {
+            cudaSetDevice(w->dev_);
+            if (cudaHostAlloc((void**) &w->kvm_host_, (size_t) w->max_ctx_ * w->dsa_rec_ * sizeof(uint16_t),
+                              cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                cudaGetLastError();
+                w->kvm_host_ = nullptr;
+                err = "glm split: the KV mirror's pinned rows did not allocate";
+                split_next_.reset();
+                return false;
+            }
+            w->kvm_src_ = r->kvm_src_;
+            w->kvm_writer_ = true;
+            std::fprintf(stderr, "glm split: layer %d's KV mirrored from CUDA%d to the parts after it (%.1f MB pinned)\n",
+                         w->kvm_src_, w->dev_, (double) w->max_ctx_ * w->dsa_rec_ * 2 / 1048576.0);
+        }
+        r->kvm_host_ = w->kvm_host_;
+    }
     // the chunks are the smallest part's (as Strata's split): the others keep their pinned staging to that, and a
     // later card that holds the first one's chunk down is named (Strata #448: a small card in a split caps every
     // stage's chunk - prompts read slower than on the first card alone)
@@ -1788,7 +1830,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             const strata::TensorInfo* t = find(nm);
             const auto xm = xtab.mats.find(nm);
             if (t == nullptr && (kind != "x" || xm == xtab.mats.end())) continue;
-            const double b = kind == "x" ? (double) xm->second.vram() : (double) pack_row_vram(nm, kind, t, fast);
+            const double b = kind == "x" ? (double) xm->second.vram() : (double) pack_row_vram(nm, kind, t, fast, nullptr, g.dsa);
             if (nm.rfind("blk.", 0) == 0) {
                 const int il = std::atoi(nm.c_str() + 4);
                 if (il >= 0 && il < L) dense[(size_t) il] += b;
@@ -2889,7 +2931,7 @@ cudaError_t strata::core::Glm5Model::pack_moe_tail(std::string& err, const std::
     }
 
     { cudaError_t e_ = cudaMemcpy(host_x_.data(), A + sc_x, (size_t) g.n_embd * sizeof(float),
-                        cudaMemcpyDeviceToHost); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return cudaErrorUnknown; } }
+                        cudaMemcpyDeviceToHost); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return cudaErrorUnknown; } }
 
     const void* act[1] = {host_act_.data()};
     float* ff1[1] = {host_ff_.data()};
@@ -2914,7 +2956,7 @@ cudaError_t strata::core::Glm5Model::pack_moe_tail(std::string& err, const std::
         for (int j = 0; j < g.n_embd; ++j) host_moe_[(size_t) j] += w * host_dn_[(size_t) j];
     }
     { cudaError_t e_ = cudaMemcpy(A + sc_moe, host_moe_.data(), (size_t) g.n_embd * sizeof(float),
-                        cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return cudaErrorUnknown; } }
+                        cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return cudaErrorUnknown; } }
     return cudaSuccess;
 }
 
@@ -3141,12 +3183,12 @@ bool strata::core::Glm5Model::pack_moe_tail_device(std::string& err, const std::
                                            (const int32_t*) (plan_dev_ + offsetof(DevPlan, tok)),
                                            (int64_t) ids.size(), (int64_t) ids.size(), dev_xq_, dev_scratch_,
                                            dev_hit_out_, nullptr, g.swiglu_exp);
-    { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
     GM_CHECK(cudaMemset(A + sc_moe, 0, (size_t) g.n_embd * sizeof(float)), err);
     for (int i = 0; i < (int) ids.size(); ++i)
         axpy_kernel<<<blocks(g.n_embd), GM_THREADS>>>(A + sc_moe, rw[(size_t) i],
                                                       dev_hit_out_ + (size_t) i * g.n_embd, g.n_embd);
-    { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
     return true;
 }
 
@@ -3451,15 +3493,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // glm-dsa on the fast path: the router, the indexer's projections and the absorbed MLA projections become the BF16
     // copies the fast kernels read (glm5-next ships them BF16; glm-dsa F32 / Q8_0) - rounded to nearest even, as
     // glm5-next's router already is
-    const auto dsa16 = [&](const std::string& name) {
-        if (!g_.dsa || !fast_mode_) return false;
-        for (const char* suf : {".ffn_gate_inp.weight", ".indexer.proj.weight", ".indexer.attn_k.weight",
-                                ".indexer.attn_q_b.weight", ".attn_k_b.weight", ".attn_v_b.weight"}) {
-            const size_t n = std::strlen(suf);
-            if (name.size() >= n && name.compare(name.size() - n, n, suf) == 0) return true;
-        }
-        return false;
-    };
+    const auto dsa16 = [&](const std::string& name) { return g_.dsa && fast_mode_ && dsa_bf16_row(name); };
     const auto dequant_at_load = [&](const std::string& name) {
         return row_kind_[name] != "0" || is_absorbed_mla(name) || dsa16(name);
     };
@@ -3513,7 +3547,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
         if (skip_upload(r)) continue;
         std::string how;
-        const uint64_t b = pack_row_vram(r.name, r.kind, t, fast_mode_, &how);
+        const uint64_t b = pack_row_vram(r.name, r.kind, t, fast_mode_, &how, g_.dsa);
         bytes += b;
         by_kind[kind_of(r.name.substr(r.name.find('.', 4) + 1)) + how] += b;
     }
@@ -3537,7 +3571,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                  // a draft's head rows (GlmDflash::split_head)
                  al((uint64_t) kWinMax * g_.n_embd * 4) + al((uint64_t) kWinMax * nc * 4) + al(kHdCandBytes) + al(4);
     }
-    { cudaError_t e_ = cudaMalloc(&w_arena_, bytes); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    { cudaError_t e_ = cudaMalloc(&w_arena_, bytes); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
     w_arena_bytes_ = bytes;
     std::ifstream dense(pack_dir + "/dense.bin", std::ios::binary);
     if (!dense) {
@@ -3562,7 +3596,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                     return false;
                 }
                 dst[j] = (uint8_t*) w_arena_ + at;
-                { cudaError_t e_ = cudaMemcpy(dst[j], sh.base + src[j], (size_t) nb[j], cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+                { cudaError_t e_ = cudaMemcpy(dst[j], sh.base + src[j], (size_t) nb[j], cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
                 at += (nb[j] + 255u) & ~(uint64_t) 255u;
             }
             x3::Mat M;
@@ -3617,7 +3651,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 err = "pack: short read on dense.bin for " + r.name;
                 return false;
             }
-            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
             at += (r.bytes + 255u) & ~(uint64_t) 255u;
             continue;
@@ -3633,7 +3667,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const size_t nbytes = strata::kernels::native_mmvq_weight_bytes(ti->type, (int) ti->shape[0],
                                                                             (int) ti->shape[1]);
             const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
-            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
             ws_map_[r.name] = strata::core::WSlot{nullptr, (int) ti->type, (const void*) ((uint8_t*) w_arena_ + at),
                                     (int64_t) ti->shape[0], (int64_t) ti->shape[1]};
             if (r.name == "token_embd.weight") {
@@ -3695,13 +3729,13 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const uint32_t* u = (const uint32_t*) host.data();
             for (size_t i = 0; i < (size_t) n_f32; ++i) h16[i] = (uint16_t) ((u[i] + 0x7FFFu + ((u[i] >> 16) & 1u)) >> 16);
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, h16.data(), (size_t) n_f32 * 2,
-                                cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+                                cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
             at += (n_f32 * 2 + 255u) & ~(uint64_t) 255u;
             continue;
         }
         { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, host.data(), (size_t) n_f32 * 4,
-                            cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+                            cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
         w_[r.name] = (const float*) ((uint8_t*) w_arena_ + at);
         ws_map_[r.name] = strata::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
         at += (n_f32 * 4 + 255u) & ~(uint64_t) 255u;
@@ -3875,10 +3909,16 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             kda_conv_[(size_t) il] = floats;
             floats += (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
         } else if (g_.dsa && dsa_rec_ > 0 && g_.kv_of(il) != il) {   // mistral-large4: its KV source's records
-            if (g_.kv_of(il) < l0_) {
-                err = "glm pack: mistral-large4 layer " + std::to_string(il) + " reads layer " +
-                      std::to_string(g_.kv_of(il)) + "'s KV, which another GPU holds - split after it, not between";
-                return false;
+            const int src = g_.kv_of(il);
+            if (src < l0_ && dsa_lat_[(size_t) src] == 0) {   // the source on an earlier GPU: a mirror of its records
+                if (kvm_src_ >= 0 && kvm_src_ != src) {
+                    err = "glm pack: mistral-large4 part reads two KV sources across the split (not supported)";
+                    return false;
+                }
+                kvm_src_ = src;
+                dsa_lat_[(size_t) src] = floats;
+                dsa_kpe_[(size_t) src] = floats + g_.kv_lora / 2;
+                floats += rec_floats * lat_rows;
             }
             dsa_lat_[(size_t) il] = dsa_lat_[(size_t) g_.kv_of(il)];
             dsa_kpe_[(size_t) il] = dsa_kpe_[(size_t) g_.kv_of(il)];
@@ -3919,7 +3959,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
     }
     state_bytes_ = (uint64_t) floats * sizeof(float);
-    { cudaError_t e_ = cudaMalloc(&state_, state_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    { cudaError_t e_ = cudaMalloc(&state_, state_bytes_); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
     if (kv_cells > 0 && !kv_stream_setup(kv_cells, err)) return false;
     if (fast_mode_ && !seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
 
@@ -3970,8 +4010,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     sc_ids = take(g_.n_exp_used);
     sc_rw = take(g_.n_exp_used);
     sc_bytes_ = (uint64_t) s * sizeof(float);
-    { cudaError_t e_ = cudaMalloc(&sc_, sc_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
-    { cudaError_t e_ = cudaMalloc(&d_pos_, sizeof(int)); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    { cudaError_t e_ = cudaMalloc(&sc_, sc_bytes_); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
+    { cudaError_t e_ = cudaMalloc(&d_pos_, sizeof(int)); if (e_ != cudaSuccess) { err = "pack (line " + std::to_string(__LINE__) + "): " + cudaGetErrorString(e_); return false; } }
 
     // STRATA_GLM_TIMING=1: the phase events (step() records them; ~10 us/token)
     if (getenv("STRATA_GLM_TIMING")) {

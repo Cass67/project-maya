@@ -6216,6 +6216,7 @@ bool Glm5Model::fast_ml4_mixer(int il, int64_t p, std::string& err) {
     d.eps = g.norm_eps;
     d.ln_eps = g.idx_ln_eps;
     d.rx = rx;
+    if (own && kvm_writer_ && il == kvm_src_) d.lat_host = kvm_host_;   // (the later parts' mirror of this layer)
     gf::dsa_rope_prep(d, s);
     gf::ssmax_heads(F->q, g.k_mla(), g.k_mla(), g.n_head, Ly.ssmax_w, Ly.ssmax_b, (int) p, s);
     if (rope) gf::rope_heads(F->q + qn, g.n_rot, g.k_mla(), g.n_head, (int) p, g.rope_base, s, 1, 0, rx);
@@ -6260,6 +6261,10 @@ bool Glm5Model::fast_layers_dsa(int64_t p, std::string& err) {
     cudaStream_t s = F->cs;
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     bool pf_pending = false;
+    if (kvm_host_ != nullptr && !kvm_writer_)   // mistral-large4: the KV source's record p from the earlier part
+        cudaMemcpyAsync((uint16_t*) (state_ + dsa_lat_[(size_t) kvm_src_]) + (size_t) p * dsa_rec_,
+                        kvm_host_ + (size_t) p * dsa_rec_, (size_t) dsa_rec_ * sizeof(uint16_t), cudaMemcpyHostToDevice,
+                        s);
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
         // (fast_layers' gates: a pipelined window's token past a wrong draft, the two-half decode's cancelled pass -
