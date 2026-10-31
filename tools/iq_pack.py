@@ -102,12 +102,14 @@ GLM5NEXT_NATIVE_OK = (
 GLMDSA_NATIVE_OK = GLM5NEXT_NATIVE_OK + (
     "attn_k_b.weight", "attn_v_b.weight", "indexer.attn_q_b.weight", "indexer.attn_k.weight",
 )
-GLM_ARCHS = ("glm5-next", "glm5next", "glm-dsa")
-ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "glm-dsa")   # unsloth spells glm5-next without the hyphen
+# mistral-large4 (Mistral Large 4, 1T) packs as glm-dsa: no q_lora (attn_q, Q8_0, is on the native set already);
+# SSMax, rope_freqs and the indexer's q_norm / ssmax are F32 and stored as such.
+GLM_ARCHS = ("glm5-next", "glm5next", "glm-dsa", "mistral-large4")
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "glm-dsa", "mistral-large4")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
-    if arch == "glm-dsa":
+    if arch in ("glm-dsa", "mistral-large4"):
         return False
     if arch in ("glm5-next", "glm5next"):
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
@@ -257,7 +259,8 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 pad = (-len(raw)) % ALIGN
                 fo.write(b"\0" * pad)
                 at += len(raw) + pad
-            elif arch in GLM_ARCHS and not name.endswith(GLMDSA_NATIVE_OK if arch == "glm-dsa" else GLM5NEXT_NATIVE_OK):
+            elif arch in GLM_ARCHS and not name.endswith(GLMDSA_NATIVE_OK if arch in ("glm-dsa", "mistral-large4")
+                                                         else GLM5NEXT_NATIVE_OK):
                 print("%s is %s: not on the BF16 upgrade list nor the %s native set; refusing to pack it "
                       "silently" % (t.name, t.type_name, arch))
                 return 1
@@ -373,6 +376,9 @@ def main() -> int:
     if arch == "glm-dsa":
         prefix = "glm-dsa."
         print("glm-dsa: packing GLM-5.3 for the Glm5Model runner (quantized dense served natively)")
+    if arch == "mistral-large4":
+        prefix = "mistral-large4."
+        print("mistral-large4: packing Mistral Large 4 for the Glm5Model runner (quantized dense served natively)")
     if arch in ("glm5-next", "glm5next"):
         # two spellings in the wild: llama.cpp's canonical "glm5-next" (llama-arch.cpp L156) and
         # unsloth's "glm5next" - the KV PREFIX follows the same spelling, so it is read per file

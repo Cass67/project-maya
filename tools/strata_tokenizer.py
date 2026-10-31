@@ -110,6 +110,21 @@ MINIMAX_PATTERN = (
     r"|\s+"
 )
 
+# The `tekken-num3` pre-tokenizer (Mistral Large 4): Mistral's tekken split from its tokenizer.json, with numbers
+# in right-aligned groups of 3 digits (llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN_NUM3, ignore_merges).  The cased
+# letter classes are tokenizer.json's; llama.cpp rewrites them as `(?=[\p{L}\p{M}])[^a-z]` / `[^A-Z]` for its regex
+# engine, which agrees on ASCII and differs only on a non-ASCII lowercase letter after an uppercase run.
+TEKKEN_NUM3_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 class _IsolatedSplits:
     """findall() over a sequence of "Isolated" splits (see DEEPSEEK3_PATTERNS)."""
 
@@ -141,11 +156,11 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax"
-                             % pre)
-        # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
-        self.ignore_merges = pre in ("glm4", "glm5")
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "tekken-num3"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
+                             "tekken-num3" % pre)
+        # glm4/glm5/tekken-num3 set ignore_merges: an exact vocab hit emits the whole pre-token piece
+        self.ignore_merges = pre in ("glm4", "glm5", "tekken-num3")
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
@@ -165,6 +180,7 @@ class Tokenizer:
             self.ranks[(parts[0], parts[1])] = i
         self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
                     regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
+                    regex.compile(TEKKEN_NUM3_PATTERN) if pre == "tekken-num3" else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
         self._nfc = pre == "minimax"
 
