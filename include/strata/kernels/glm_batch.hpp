@@ -132,7 +132,7 @@ void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, flo
 
 /// The router per token (router_sigmoid's arithmetic: sigmoid, bias selection, stable top-k, normalised weights).
 void route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w, int T, int* ids,
-           float* w, cudaStream_t s);
+           float* w, cudaStream_t s, bool softmax = false);   // softmax: mistral-large4 (exp(l - max), renormalized)
 /// Per expert: counts[e] and the stable rank (in (t, j) order) of every routed entry (rank[t*k + j]).
 void expert_count(const int* ids, int n, int n_expert, int* counts, int* rank, cudaStream_t s);
 /// dst[i] = src[i] by the SMs: dst may be pinned host memory, written over the bus without a copy engine (a small

@@ -2044,17 +2044,25 @@ __device__ void topk_argmax(float* sel, int E, int k, int* out, float* s_bv, int
 
 __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int E, int k, float w_scale, int norm_w, int* __restrict__ ids,
-                                                    float* __restrict__ w) {
+                                                    float* __restrict__ w, int softmax) {
     const int t = blockIdx.x, tid = threadIdx.x;
     __shared__ float s_p[512], s_sel[512];
+    __shared__ float s_lmax;
     __shared__ int s_ids[8];
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
     __shared__ int bad;
-    if (tid == 0) bad = 0;
+    if (tid == 0) {
+        bad = 0;
+        float m = -INFINITY;
+        if (softmax)
+            for (int e = 0; e < E; ++e) m = fmaxf(m, logits[(size_t) t * E + e]);
+        s_lmax = m;
+    }
     __syncthreads();
     for (int e = tid; e < E; e += blockDim.x) {
-        const float p = 1.0f / (1.0f + expf(-logits[(size_t) t * E + e]));
+        const float p = softmax ? expf(logits[(size_t) t * E + e] - s_lmax)
+                                : 1.0f / (1.0f + expf(-logits[(size_t) t * E + e]));
         s_p[e] = p;
         s_sel[e] = bias ? p + bias[e] : p;
         if (!isfinite(logits[(size_t) t * E + e]) || !isfinite(s_sel[e])) atomicExch(&bad, 1);
@@ -2662,9 +2670,9 @@ void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, flo
 }
 
 void route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w, int T, int* ids,
-           float* w, cudaStream_t s) {
+           float* w, cudaStream_t s, bool softmax) {
     if (T <= 0) return;
-    route_kernel<<<T, 256, 0, s>>>(logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, ids, w);
+    route_kernel<<<T, 256, 0, s>>>(logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, ids, w, softmax ? 1 : 0);
     check("route");
 }
 

@@ -7440,6 +7440,8 @@ __global__ void __launch_bounds__(1024) layer_norm_row_kernel(const float* __res
                                                                float* __restrict__ y) {
     __shared__ float sred[32];
     const int tid = threadIdx.x;
+    x += (size_t) blockIdx.x * n;
+    y += (size_t) blockIdx.x * n;
     float sum = 0.0f;
     for (int e = tid; e < n; e += blockDim.x) sum += x[e];
     const float mu = block_sum(sum, sred) / (float) n;
@@ -7565,8 +7567,8 @@ void softcap(float* x, int n, float cap, cudaStream_t s) {
     launch_check("softcap");
 }
 
-void layer_norm_row(const float* x, const float* w, const float* b, int n, float eps, float* y, cudaStream_t s) {
-    layer_norm_row_kernel<<<1, 1024, 0, s>>>(x, w, b, n, eps, y);
+void layer_norm_row(const float* x, const float* w, const float* b, int n, float eps, float* y, cudaStream_t s, int T) {
+    layer_norm_row_kernel<<<T, 1024, 0, s>>>(x, w, b, n, eps, y);
     launch_check("layer_norm_row");
 }
 

@@ -488,7 +488,8 @@ void dsa_rope_prep(const DsaRopePrepArgs& a, cudaStream_t s);
 /// x = cap * tanh(x / cap) over n floats (mistral-large4's final logit softcap)
 void softcap(float* x, int n, float cap, cudaStream_t s);
 /// y = layer_norm(x) * w + b over n floats (one row; mistral-large4's indexer q norm)
-void layer_norm_row(const float* x, const float* w, const float* b, int n, float eps, float* y, cudaStream_t s);
+void layer_norm_row(const float* x, const float* w, const float* b, int n, float eps, float* y, cudaStream_t s,
+                    int T = 1);   // (T rows, n apart)
 /// SSMax (mistral-large4): head h's first `width` floats (x + stride*h, T rows ld floats apart, row t at pos + t) times
 /// s[h] * log(pos + 1) + b[h], the log as llama.cpp feeds it (1 + log in double, f32, - 1)
 void ssmax_heads(float* x, int width, int stride, int n_head, const float* s_w, const float* s_b, int pos,

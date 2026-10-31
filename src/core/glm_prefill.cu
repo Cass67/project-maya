@@ -231,9 +231,10 @@ struct DsaBufs {
 };
 DsaBufs carve_dsa(Carve& c, size_t T, const Glm5Geometry& g, int max_pools) {
     DsaBufs b{};
+    const size_t qr = g.ml4 ? (size_t) g.n_embd : (size_t) g.q_lora;   // (mistral-large4: the indexer q's layer_norm(x))
     b.qr_raw = c.take<float>(T * g.q_lora);
-    b.qr = c.take<float>(T * g.q_lora);
-    b.qr16 = c.take<uint16_t>(T * g.q_lora);
+    b.qr = c.take<float>(T * qr);
+    b.qr16 = c.take<uint16_t>(T * qr);
     b.kv_raw = c.take<float>(T * (g.kv_lora + (g.dsa ? g.n_rot : 0)));   // (glm-dsa: + k_pe)
     b.ik_raw = c.take<float>(T * g.idx_key);
     b.ig_raw = c.take<float>(T * g.idx_key);
@@ -1039,12 +1040,14 @@ void Glm5Model::prefill_settle(double pinned_share) {
 static std::pair<int64_t, int64_t> weight_scratch(const Glm5Geometry& g, bool has_dsa) {
     const int64_t E = g.n_embd;
     int64_t w32 = 2 << 20;
-    if (has_dsa)
-        w32 = std::max<int64_t>({w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
+    if (has_dsa)   // (mistral-large4's NoPE layers absorb the whole k_mla head)
+        w32 = std::max<int64_t>({w32, (int64_t) g.n_head * g.kv_lora * (g.ml4 ? g.k_mla() : g.qk_nope),
+                                 (int64_t) g.n_head * g.v_head * g.kv_lora});
     int64_t w16 = std::max<int64_t>((int64_t) g.d_inner() * E, (int64_t) 2048 * E);
 #if defined(STRATA_USE_HIP)
     if (has_dsa)   // the MLA products' FP16 copy of wk_b / wv_b
-        w16 = std::max<int64_t>({w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
+        w16 = std::max<int64_t>({w16, (int64_t) g.n_head * g.kv_lora * (g.ml4 ? g.k_mla() : g.qk_nope),
+                                 (int64_t) g.n_head * g.v_head * g.kv_lora});
 #endif
     return {w16, w32};
 }
@@ -1054,10 +1057,6 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 bool Glm5Model::prefill_setup(std::string& err) {
     (void) err;
     if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
-    if (g_.ml4) {
-        std::fprintf(stderr, "glm prefill: mistral-large4's batched prompt path is not ported yet - token by token\n");
-        return true;
-    }
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
         return true;
@@ -1085,10 +1084,11 @@ bool Glm5Model::prefill_setup(std::string& err) {
             deq_ok(Ly.v, "attn_v", il);
         } else {
             has_dsa = true;
-            deq_ok(Ly.q_a, "attn_q_a", il);
-            if (Ly.idx_q_b == nullptr) deq_ok(Ly.idx_q_b_x, "indexer.attn_q_b", il);
+            if (!g.ml4) deq_ok(Ly.q_a, "attn_q_a", il);   // (mistral-large4: q_b is attn_q; kv_a / the indexer where owned)
+            if (Ly.idx_q_b == nullptr && (!g.ml4 || g.indexer_full[(size_t) il]))
+                deq_ok(Ly.idx_q_b_x, "indexer.attn_q_b", il);
             deq_ok(Ly.q_b, "attn_q_b", il);
-            deq_ok(Ly.kv_a, "attn_kv_a", il);
+            if (g.kv_of(il) == il) deq_ok(Ly.kv_a, "attn_kv_a", il);
         }
         deq_ok(Ly.out, "attn_output", il);
         if (Ly.moe) {
@@ -2490,6 +2490,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     prestage(next_moe(l0_));   // (the dense layers before the first MoE one run meanwhile)
     for (auto& t : S->tr) t.on = false;
     bool dsa_sel = false;   // (glm-dsa: this chunk's rows hold a full indexer layer's selection)
+    if (kvm_host_ != nullptr && !kvm_writer_)   // mistral-large4: the KV source's records of this chunk, from the earlier part
+        cudaMemcpyAsync((uint16_t*) (state_ + dsa_lat_[(size_t) kvm_src_]) + (size_t) p0 * dsa_rec_,
+                        kvm_host_ + (size_t) p0 * dsa_rec_, (size_t) T * dsa_rec_ * sizeof(uint16_t),
+                        cudaMemcpyHostToDevice, s);
     for (int il = l0_; il < l1_; ++il) {
         progress_at("the prompt: layer", il);   // a layer is the serve watchdog's heartbeat (issue #40)
         progress_beat();
@@ -2532,6 +2536,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             float* mixer = S->mixer + (size_t) t0 * E;
             const int pt = (int) (p0 + t0), KS = g.idx_top_k, HQ = g.n_head * g.k_mla();
             const bool full = g.indexer_full[(size_t) il] != 0;
+            // mistral-large4: no q_lora, NoPE layers (n_rot 0, the whole head absorbed), a KV source's records read in
+            // place of the layer's own, SSMax on q / the indexer q, YaRN + rope_freqs (see fast_ml4_mixer)
+            const bool own = g.kv_of(il) == il;
+            const int n_rot = g.has_rope(il) ? g.n_rot : 0, qn = g.qk_nope_l(il);
+            gf::RopeExt rx;
+            if (g.ml4) {
+                rx.freq_scale = g.freq_scale;
+                rx.ext = g.yarn_ext;
+                rx.lo = g.yarn_lo;
+                rx.hi = g.yarn_hi;
+                rx.mscale = g.yarn_mscale;
+                if (const auto it = w_.find("rope_freqs.weight"); it != w_.end()) rx.ff = it->second;
+            }
             if (!full && !dsa_sel) {
                 err = "glm prefill: glm-dsa layer " + std::to_string(il) + " shares an indexer selection this part never made";
                 return false;
@@ -2539,8 +2556,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             Carve c{S->uni};
             DsaBufs B = carve_dsa(c, (size_t) tn, g, S->max_pools);
             int* const cells = S->dsa_cells + (size_t) t0 * KS;
-            hgemm_q(Ly.q_a, g.q_lora, E, x16, E, B.qr_raw, g.q_lora, tn, 0.0f);
-            hgemm_q(Ly.kv_a, g.kv_lora + g.n_rot, E, x16, E, B.kv_raw, g.kv_lora + g.n_rot, tn, 0.0f);
+            if (g.ml4) hgemm_q(Ly.q_b, HQ, E, x16, E, B.q, HQ, tn, 0.0f);
+            else hgemm_q(Ly.q_a, g.q_lora, E, x16, E, B.qr_raw, g.q_lora, tn, 0.0f);
+            if (own) hgemm_q(Ly.kv_a, g.kv_lora + n_rot, E, x16, E, B.kv_raw, g.kv_lora + n_rot, tn, 0.0f);
             if (full) {
                 sgemm_bf16(Ly.idx_k, g.idx_key, E, xs, E, B.ik_raw, g.idx_key, tn, 1.0f);
                 sgemm_bf16(Ly.idx_proj, g.idx_heads, E, xs, E, B.iw, g.idx_heads, tn,
@@ -2550,17 +2568,18 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             float* const kpe = (float*) (lat + g.kv_lora);
             float* const ik = state_ + dsa_pool_[(size_t) il];
             gf::DsaRopePrepArgs d;
-            d.qr_raw = B.qr_raw;
+            d.qr_raw = g.ml4 ? nullptr : B.qr_raw;
             d.q_a_norm = Ly.q_a_norm;
             d.qr = B.qr;
             d.qr16 = B.qr16;
             d.q_lora = g.q_lora;
-            d.kv_raw = B.kv_raw;
+            d.kv_raw = own ? B.kv_raw : nullptr;
             d.kv_norm = Ly.kv_a_norm;
             d.lat = lat;
             d.kpe = kpe;
             d.kv_lora = g.kv_lora;
-            d.n_rot = g.n_rot;
+            d.n_rot = n_rot;
+            d.rx = rx;
             d.ik_raw = full ? B.ik_raw : nullptr;
             d.k_norm_w = Ly.k_norm_w;
             d.k_norm_b = Ly.k_norm_b;
@@ -2572,6 +2591,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             d.eps = g.norm_eps;
             d.ln_eps = g.idx_ln_eps;
             d.rec = dsa_rec_;
+            if (own && kvm_writer_ && il == kvm_src_) d.lat_host = kvm_host_;   // (the later parts' mirror)
             if (kv_host != nullptr) {   // + the host copy and the resident slots (the stage is this chunk's only)
                 d.lat_host = (uint16_t*) kv_host;
                 d.lat_slots = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
@@ -2579,16 +2599,27 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.lat_page = kv_->page;
             }
             gf::dsa_rope_prep(d, s);
-            hgemm_q(Ly.q_b, HQ, g.q_lora, B.qr16, g.q_lora, B.q, HQ, tn, 0.0f);
-            gf::rope_heads(B.q + g.qk_nope, g.n_rot, g.k_mla(), g.n_head, pt, g.rope_base, s, tn, HQ);
+            if (g.ml4) {
+                gf::ssmax_heads(B.q, g.k_mla(), g.k_mla(), g.n_head, Ly.ssmax_w, Ly.ssmax_b, pt, s, tn, HQ);
+            } else {
+                hgemm_q(Ly.q_b, HQ, g.q_lora, B.qr16, g.q_lora, B.q, HQ, tn, 0.0f);
+            }
+            if (n_rot > 0) gf::rope_heads(B.q + qn, g.n_rot, g.k_mla(), g.n_head, pt, g.rope_base, s, tn, HQ, rx);
             S->mark("dsa_proj", s);
             if (full) {
                 // the token path's selection (a token is its own pool): every position while they fit the top-k, in
                 // order; past it the stable top-k of the scores (gb::dsa_select's rows take dsa_select's top_pools)
                 if (pt + tn > KS) {
-                    sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq,
-                               g.idx_heads * g.idx_key, tn, 1.0f);
-                    gf::rope_heads(B.iq, g.n_rot, g.idx_key, g.idx_heads, pt, g.rope_base, s, tn, g.idx_heads * g.idx_key);
+                    const int IQ = g.idx_heads * g.idx_key;
+                    if (g.ml4) {
+                        gf::layer_norm_row(xs, Ly.idx_q_norm_w, Ly.idx_q_norm_b, E, g.idx_ln_eps, B.qr, s, tn);
+                        sgemm_bf16(Ly.idx_q_b, IQ, E, B.qr, E, B.iq, IQ, tn, 1.0f);
+                        gf::ssmax_heads(B.iq, g.idx_key, g.idx_key, g.idx_heads, Ly.idx_ssmax_w, Ly.idx_ssmax_b, pt, s, tn,
+                                        IQ);
+                    } else {
+                        sgemm_bf16(Ly.idx_q_b, IQ, g.q_lora, B.qr, g.q_lora, B.iq, IQ, tn, 1.0f);
+                    }
+                    if (n_rot > 0) gf::rope_heads(B.iq, g.n_rot, g.idx_key, g.idx_heads, pt, g.rope_base, s, tn, IQ, rx);
                     gb::dsa_score(B.iq, ik, B.iw, g.idx_key, g.idx_heads, pt, 1, tn, pt + tn, B.score, B.score_ld, s);
                 }
                 gb::dsa_select(B.score, B.score_ld, pt, 1, KS, 0, tn, KS, cells, B.n_sel, s);
@@ -2597,16 +2628,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             }
             dsa_nsel_kernel<<<(tn + 255) / 256, 256, 0, s>>>(B.n_sel, pt, tn, KS);
             // q_abs[t][h] = wk_b[h] (kv_lora x qk_nope) . q_nope[t][h]
-            gb::bf16_to_f32(Ly.k_b, S->w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, s);
-            blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one, S->w32,
-                                              g.qk_nope, (long long) g.kv_lora * g.qk_nope, B.q, HQ, g.k_mla(), &zero,
+            gb::bf16_to_f32(Ly.k_b, S->w32, (int64_t) g.n_head * g.kv_lora * qn, s);
+            blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.kv_lora, tn, qn, &one, S->w32,
+                                              qn, (long long) g.kv_lora * qn, B.q, HQ, g.k_mla(), &zero,
                                               B.q_abs, g.n_head * g.kv_lora, g.kv_lora, g.n_head),
                     "dsa q_abs");
             S->mark("dsa_qabs", s);
 #if defined(STRATA_USE_HIP)
             gb::mla_attn_wmma2(B.q_abs, lat, cells, B.n_sel, KS, g.n_head, g.kv_lora,
-                               1.0f / std::sqrt((float) (g.qk_nope + g.n_rot)), tn, B.ctx, s, false, B.q + g.qk_nope,
-                               g.k_mla(), kpe, g.n_rot, dsa_rec_, dsa_rec_ / 2);
+                               1.0f / std::sqrt((float) (qn + n_rot)), tn, B.ctx, s, false,
+                               n_rot > 0 ? B.q + qn : nullptr, g.k_mla(), n_rot > 0 ? kpe : nullptr, n_rot, dsa_rec_,
+                               dsa_rec_ / 2);
 #else
             err = "glm prefill: the glm-dsa prompt attention is HIP only";
             return false;
@@ -2899,7 +2931,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
         S->mark("shexp", s);
         sgemm_bf16(Ly.router, NE, E, S->x, E, M.logits, NE, T, 1.0f);
-        gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s);
+        gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s, g.ml4);
         gb::expert_count(M.ids, T * K, NE, M.counts, M.rank, s);
         gb::copy_i32(M.counts, S->h_counts, NE, s);   // (not a copy: the engine may be busy with x, x_down)
         if (calc_on) {   // the routes for the other part, the same way (landed by the sync below)
