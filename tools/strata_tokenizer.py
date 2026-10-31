@@ -411,8 +411,11 @@ def extract(gguf_path, out_dir) -> dict:
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "ignore_merges": tk.ignore_merges,
-        "pre_pattern": GLM_PATTERN if tk.ignore_merges else QWEN35_PATTERN,
-        "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
+        "pre_pattern": TEKKEN_NUM3_PATTERN if tk.pre == "tekken-num3" else
+                       GLM_PATTERN if tk.ignore_merges else QWEN35_PATTERN,
+        "pre_pattern_source": ("Mistral Large 4's tokenizer.json (tekken, numbers in groups of 3; ignore_merges)"
+                               if tk.pre == "tekken-num3" else
+                               ".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.ignore_merges else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }

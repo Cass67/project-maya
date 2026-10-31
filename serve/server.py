@@ -2133,6 +2133,8 @@ class Service:
                             _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>") +
                             # MiniMax-M3.1 with [e~[ (and would start the next turn with ]~b])
                             _special_ids("[e~[") + _special_ids("]~b]"))
+        if getattr(template, "mistral", False):   # Mistral Large 4 ends its turn with </s>
+            self.stop_ids |= set(_special_ids("</s>"))
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
@@ -2145,7 +2147,8 @@ class Service:
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
-        end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else _special_ids("</think>")
+        end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else \
+            _special_ids("[/THINK]") if getattr(template, "mistral", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
@@ -3590,6 +3593,7 @@ class Service:
                                 stream_tools=True, dsml=getattr(self.template, "deepseek", False),
                                 token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
+                                mistral=getattr(self.template, "mistral", False),
                                 strict_tools=responses, single_tool=single_tool)
         parser = new_parser()
         # calls the loop guard blocks in this answer (prepare, _block_suffixes): {(name, args): (ToolRepeat, ids)}.

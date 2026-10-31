@@ -61,6 +61,9 @@ class ChatTemplate:
         # is told.  Thinking off (a client's, or a forced tool call's) closes the block the way its Qwen base's template
         # writes thinking off - <think>\n\n</think>\n\n - so the prompt and the server's parser agree
         self.forced_thinking = bool(re.search(r"set\s+enable_thinking\s*=\s*true", self.source))
+        # Mistral Large 4: [INST] turns, reasoning_effort low / medium / high (no "off": off is low), [THINK] reasoning
+        # the model opens itself and [TOOL_CALLS]NAME[ARGS]{json} calls (OutputParser(mistral=True) reads them)
+        self.mistral = "[TOOL_CALLS]" in self.source and "[INST]" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -109,6 +112,16 @@ class ChatTemplate:
             elif level in EFFORT_NAMES:
                 kwargs["reasoning_effort"] = level
             # (its template reads tool.function: the server's flat tools go back into OpenAI's form)
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
+                                        **kwargs)
+        if self.mistral:
+            kwargs.setdefault("bos_token", "<s>")   # (its template writes them: the vocabulary's own literals)
+            kwargs.setdefault("eos_token", "</s>")
+            off = kwargs.pop("enable_thinking", None) is False
+            level = name or kwargs.pop("reasoning_effort", None)
+            kwargs.pop("reasoning_effort", None)
+            kwargs["reasoning_effort"] = "low" if off else level if level in ("low", "medium", "high") else "high"
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
@@ -897,6 +910,106 @@ def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset(
     return False
 
 
+class MistralRewriter:
+    """Mistral Large 4's output rewritten, as it streams, into what OutputParser reads (DeepSeek's path: GLM's tool-call
+    form with JSON values).  `[THINK]` opens reasoning (THINK_AGAIN: the parser starts in the answer - the model decides
+    whether to think), `[/THINK]` is </think>; `[TOOL_CALLS]NAME[ARGS]{json}` - one a call, the next call's
+    [TOOL_CALLS] or the end closing it - becomes `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...
+    </tool_call>` with V JSON, once the arguments' object is whole.  A tag split across deltas is held until it is
+    whole; arguments that do not parse go out as the text they were."""
+
+    MARKS = ("[THINK]", "[/THINK]", "[TOOL_CALLS]")
+
+    def __init__(self):
+        self.buf = ""
+        self.mode = "plain"          # plain | name (after [TOOL_CALLS]) | args (after [ARGS])
+        self.name = ""
+        self.args = ""
+        self.depth = 0
+        self.in_str = self.esc = False
+
+    @staticmethod
+    def _esc(s: str) -> str:
+        return s.replace("<", "\\u003c")
+
+    def _call(self) -> str:
+        name, raw = self.name.strip(), self.args.strip() or "{}"
+        self.mode, self.name, self.args, self.depth, self.in_str, self.esc = "plain", "", "", 0, False, False
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            obj = None
+        if not isinstance(obj, dict):
+            return "[TOOL_CALLS]" + name + "[ARGS]" + raw
+        body = "".join(ARG_KEY + k + ARG_KEY_END + ARG_VAL + self._esc(json.dumps(v, ensure_ascii=False)) + ARG_VAL_END
+                       for k, v in obj.items())
+        return CALL_START + name + body + CALL_END
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            if self.mode == "plain":
+                hits = [(i, m) for m in self.MARKS for i in [self.buf.find(m)] if i >= 0]
+                if not hits:
+                    keep = max((n for m in self.MARKS for n in range(1, len(m)) if self.buf.endswith(m[:n])), default=0)
+                    out.append(self.buf[:len(self.buf) - keep])
+                    self.buf = self.buf[len(self.buf) - keep:]
+                    break
+                i, m = min(hits)
+                out.append(self.buf[:i])
+                self.buf = self.buf[i + len(m):]
+                if m == "[THINK]":
+                    out.append(THINK_AGAIN)
+                elif m == "[/THINK]":
+                    out.append(THINK_END)
+                else:
+                    self.mode = "name"
+            elif self.mode == "name":
+                i = self.buf.find("[ARGS]")
+                if i < 0:
+                    break
+                self.name, self.buf, self.mode = self.buf[:i], self.buf[i + len("[ARGS]"):], "args"
+            else:
+                # the arguments' object: whole when its braces close (strings and escapes followed)
+                done = None
+                for k, ch in enumerate(self.buf):
+                    if not self.args.strip() and self.depth == 0:
+                        if ch.isspace():
+                            continue
+                        if ch != "{":   # not an object: the text up to the next call / the end (finish)
+                            break
+                    if self.in_str:
+                        self.esc, self.in_str = (False, True) if self.esc else (ch == "\\", ch != '"')
+                    elif ch == '"':
+                        self.in_str = True
+                    elif ch == "{":
+                        self.depth += 1
+                    elif ch == "}":
+                        self.depth -= 1
+                        if self.depth == 0:
+                            done = k
+                            break
+                if done is None:
+                    self.args += self.buf
+                    self.buf = ""
+                    break
+                self.args += self.buf[:done + 1]
+                self.buf = self.buf[done + 1:]
+                out.append(self._call())
+        return "".join(out)
+
+    def finish(self) -> str:
+        rest, self.buf = self.buf, ""
+        if self.mode == "name":
+            self.name += rest
+            return self._call()
+        if self.mode == "args":
+            self.args += rest
+            return self._call()
+        return rest
+
+
 class MinimaxRewriter:
     """MiniMax-M3.1's output rewritten, as it streams, into what OutputParser reads (DeepSeek's path: GLM's tool-call
     form with JSON values).  `<mm:think>` opens reasoning: THINK_AGAIN for the parser, which drops it while it is
@@ -1076,8 +1189,9 @@ class OutputParser:
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False):
-        self.state = "reasoning" if thinking else "content"
+                 token_only_end: bool = False, mistral: bool = False):
+        # (mistral: the model opens its own reasoning with [THINK] - the answer comes first until it does)
+        self.state = "reasoning" if thinking and not mistral else "content"
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
         # the server's own code, would have its reasoning cut there and spill into the answer).  The server closes it
@@ -1086,11 +1200,12 @@ class OutputParser:
         self.token_only_end = token_only_end
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
-        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
+        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else MistralRewriter() if mistral \
+            else None
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
-        self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
+        self.schemas = {} if dsml or minimax or mistral else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
