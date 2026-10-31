@@ -265,6 +265,7 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
         err = "glm multi: output head";
         return false;
     }
+    if (g.softcap > 0.0f) gf::softcap(tail->sc_ + tail->sc_logits, g.n_vocab, g.softcap, FT->cs);
     // the logits are the tail's shared scratch: the draw goes on the same stream right behind them, before the next
     // sequence's head can write them again
     if ((sp.greedy || sp.temperature <= 0.0f) && sp.penalty_last_n <= 0)   // (penalties: the sampler's greedy pick)

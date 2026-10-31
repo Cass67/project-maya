@@ -3934,6 +3934,8 @@ struct RouteArgs {
     float affinity;             // STRATA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
                                 // weight stays its own probability) - LOSSY, it changes which experts run (0: off)
     int rank_sel;               // the selections by topk_rank (STRATA_GLM_ROUTE_RANK; the host checks E fits it)
+    int softmax;                // mistral-large4: the probs are exp(logit - max) - with norm_w, exactly the softmax's
+                                // renormalized weights (its denominator cancels), the same order as the logits
     unsigned long long* prof;   // STRATA_GLM_ROUTE_PROF (measurement): block 0's cycles from its start to each phase's
                                 // end, summed over routes (host-mapped; [15] counts the routes); null: off
     int fast;                   // STRATA_GLM_ROUTE_FAST (on by default; =0: the old order, A/B): the error flag from
@@ -3978,8 +3980,17 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     // the CPU lane's frequency counts age: every 4096 routes all of them halve (the whole block, before any use)
     if (a.cpu_plan != 0ull && a.d.dcnt != nullptr && ((*a.d.seq + 1) & 4095u) == 0u)
         for (int i = tid; i < a.d.n_keys; i += ROUTE_THREADS) a.d.dcnt[i] >>= 1;
+    __shared__ float s_lmax;
+    if (a.softmax) {
+        if (tid == 0) {
+            float m = -INFINITY;
+            for (int e = 0; e < E; ++e) m = fmaxf(m, a.logits[e]);
+            s_lmax = m;
+        }
+        __syncthreads();
+    }
     for (int e = tid; e < E; e += ROUTE_THREADS) {
-        const float p = 1.0f / (1.0f + expf(-a.logits[e]));
+        const float p = a.softmax ? expf(a.logits[e] - s_lmax) : 1.0f / (1.0f + expf(-a.logits[e]));
         s_p[e] = p;
         s_sel[e] = a.bias ? p + a.bias[e] : p;
         if (a.affinity > 0.0f && a.d.tab != nullptr && a.d.tab[(size_t) a.layer * E + e] != 0ull) s_sel[e] += a.affinity;
@@ -6565,7 +6576,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                int max_prefetch, const float* ahead_logits, const float* const* ahead_bias, int n_ahead,
                int skip_from, unsigned long long cpu_plan, int promote_min, int pf_rank, int near_n, int win,
                unsigned int* scr_used, int win_n, int disk_skip_from, float disk_skip_w, float miss_skip_w,
-               int win_rows) {
+               int win_rows, bool softmax) {
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
@@ -6576,6 +6587,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
     }();
     a.affinity = affinity;
+    a.softmax = softmax ? 1 : 0;
     // STRATA_GLM_ROUTE_RANK=0: the selections by topk_warp's serial rounds again (A/B); topk_rank needs whole warps of
     // experts that one block's threads cover and at most 8 picks
     static const bool rank_on = [] {
@@ -7317,13 +7329,27 @@ void argmax_join(const int* a, const int* b, int c0, int* out, cudaStream_t s) {
 // ref/glm_dsa.py's arithmetic; the reference path's kernels (glm_model.cu, glm_dsa.cu) are the parity they follow.
 namespace {
 
-// the rotation of pair i (ggml rope NORM, no YaRN): theta = pos * base^(-2i/n_rot), stepped in f32 like ggml's cache
+// the rotation of pair i (ggml rope NORM): theta = pos * base^(-2i/n_rot), stepped in f32 like ggml's cache; with a
+// RopeExt (mistral-large4) divided by ff[i], YaRN-mixed and magnitude-scaled as ggml-cpu's rope_yarn
 __device__ __forceinline__ void rope_pair(float x0, float x1, int i, int n_rot, int pos, float base, float& y0,
-                                          float& y1) {
+                                          float& y1, const RopeExt& rx = RopeExt{}) {
     const float theta_scale = powf(base, -2.0f / (float) n_rot);
     float theta = (float) pos;
     for (int k = 0; k < i; ++k) theta *= theta_scale;
-    const float c = cosf(theta), sn = sinf(theta);
+    float c, sn;
+    if (rx.ext != 0.0f || rx.ff != nullptr || rx.freq_scale != 1.0f) {
+        const float t_ex = theta / (rx.ff ? rx.ff[i] : 1.0f);
+        float t = rx.freq_scale * t_ex;
+        if (rx.ext != 0.0f) {
+            const float mix = (1.0f - fminf(1.0f, fmaxf(0.0f, ((float) i - rx.lo) / fmaxf(0.001f, rx.hi - rx.lo)))) * rx.ext;
+            t = t * (1.0f - mix) + t_ex * mix;
+        }
+        c = cosf(t) * rx.mscale;
+        sn = sinf(t) * rx.mscale;
+    } else {
+        c = cosf(theta);
+        sn = sinf(theta);
+    }
     y0 = x0 * c - x1 * sn;
     y1 = x0 * sn + x1 * c;
 }
@@ -7338,7 +7364,7 @@ __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) 
         a.qr += (size_t) t * a.q_lora;
         if (a.qr16 != nullptr) a.qr16 += (size_t) t * a.q_lora;
     }
-    a.kv_raw += (size_t) t * (a.kv_lora + a.n_rot);
+    if (a.kv_raw != nullptr) a.kv_raw += (size_t) t * (a.kv_lora + a.n_rot);
     if (a.ik_raw != nullptr) a.ik_raw += (size_t) t * a.idx_key;
     if (blockIdx.x == 0) {   // qr = rms(qr_raw) * w, and its q8_1
         if (a.qr_raw == nullptr) return;   // a batched NextN cache fill needs only the latent/k_pe
@@ -7352,6 +7378,7 @@ __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) 
             if (a.qr16 != nullptr) a.qr16[e] = __half_as_ushort(__float2half(xv));
         }
     } else if (blockIdx.x == 1) {   // the latent (normed, FP16 cache row p) and k_pe (roped, NOT normed, F32 row p)
+        if (a.kv_raw == nullptr) return;   // (mistral-large4: this layer reads another layer's KV)
         float ss = 0.0f;
         for (int e = tid; e < a.kv_lora; e += blockDim.x) ss += a.kv_raw[e] * a.kv_raw[e];
         const float inv = rsqrtf(block_sum(ss, sred) / (float) a.kv_lora + a.eps);
@@ -7370,7 +7397,7 @@ __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) 
             }
             if (tid < a.n_rot / 2) {
                 float y0, y1;
-                rope_pair(a.kv_raw[a.kv_lora + 2 * tid], a.kv_raw[a.kv_lora + 2 * tid + 1], tid, a.n_rot, a.p, a.base, y0, y1);
+                rope_pair(a.kv_raw[a.kv_lora + 2 * tid], a.kv_raw[a.kv_lora + 2 * tid + 1], tid, a.n_rot, a.p, a.base, y0, y1, a.rx);
                 for (int k = 0; k < nt; ++k) {
                     float* kp = (float*) (tg[k] + a.kv_lora);
                     kp[2 * tid] = y0;
@@ -7383,7 +7410,7 @@ __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) 
             a.lat[(size_t) a.p * a.kv_lora + e] = __half_as_ushort(__float2half(a.kv_raw[e] * inv * a.kv_norm[e]));
         if (tid < a.n_rot / 2) {
             float y0, y1;
-            rope_pair(a.kv_raw[a.kv_lora + 2 * tid], a.kv_raw[a.kv_lora + 2 * tid + 1], tid, a.n_rot, a.p, a.base, y0, y1);
+            rope_pair(a.kv_raw[a.kv_lora + 2 * tid], a.kv_raw[a.kv_lora + 2 * tid + 1], tid, a.n_rot, a.p, a.base, y0, y1, a.rx);
             a.kpe[(size_t) a.p * a.n_rot + 2 * tid] = y0;
             a.kpe[(size_t) a.p * a.n_rot + 2 * tid + 1] = y1;
         }
@@ -7400,7 +7427,7 @@ __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) 
         float* row = a.ik + (size_t) a.p * n;
         if (tid < a.n_rot / 2) {
             float y0, y1;
-            rope_pair(sy[2 * tid], sy[2 * tid + 1], tid, a.n_rot, a.p, a.base, y0, y1);
+            rope_pair(sy[2 * tid], sy[2 * tid + 1], tid, a.n_rot, a.p, a.base, y0, y1, a.rx);
             row[2 * tid] = y0;
             row[2 * tid + 1] = y1;
         }
@@ -7408,15 +7435,43 @@ __global__ void __launch_bounds__(1024) dsa_rope_prep_kernel(DsaRopePrepArgs a) 
     }
 }
 
+__global__ void __launch_bounds__(1024) layer_norm_row_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                               const float* __restrict__ b, int n, float eps,
+                                                               float* __restrict__ y) {
+    __shared__ float sred[32];
+    const int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int e = tid; e < n; e += blockDim.x) sum += x[e];
+    const float mu = block_sum(sum, sred) / (float) n;
+    float var = 0.0f;
+    for (int e = tid; e < n; e += blockDim.x) var += (x[e] - mu) * (x[e] - mu);
+    const float inv = rsqrtf(block_sum(var, sred) / (float) n + eps);
+    for (int e = tid; e < n; e += blockDim.x) y[e] = (x[e] - mu) * inv * w[e] + b[e];
+}
+
+__global__ void softcap_kernel(float* __restrict__ x, int n, float cap) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = tanhf(x[i] / cap) * cap;
+}
+
+__global__ void ssmax_heads_kernel(float* __restrict__ x, int width, int stride, int n_head, const float* __restrict__ sw,
+                                   const float* __restrict__ sb, int pos, int ld) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_head * width) return;
+    const int h = idx / width;
+    const float lp = (float) (log((double) (pos + (int) blockIdx.y) + 1.0) + 1.0) - 1.0f;
+    x[(size_t) ld * blockIdx.y + (size_t) stride * h + idx % width] *= lp * sw[h] + sb[h];
+}
+
 __global__ void rope_heads_kernel(float* __restrict__ x, int n_rot, int stride, int n_head, int pos, float base,
-                                  int ld) {
+                                  int ld, RopeExt rx) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_head * (n_rot / 2)) return;
     const int h = idx / (n_rot / 2), i = idx % (n_rot / 2);
     pos += blockIdx.y;
     float* xh = x + (size_t) ld * blockIdx.y + (size_t) stride * h + 2 * i;
     float y0, y1;
-    rope_pair(xh[0], xh[1], i, n_rot, pos, base, y0, y1);
+    rope_pair(xh[0], xh[1], i, n_rot, pos, base, y0, y1, rx);
     xh[0] = y0;
     xh[1] = y1;
 }
@@ -7498,10 +7553,28 @@ void dsa_rope_prep(const DsaRopePrepArgs& a, cudaStream_t s) {
     launch_check("dsa_rope_prep");
 }
 
-void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base, cudaStream_t s, int T, int ld) {
+void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base, cudaStream_t s, int T, int ld,
+                const RopeExt& rx) {
     const int n = n_head * (n_rot / 2);
-    rope_heads_kernel<<<dim3((n + 255) / 256, (unsigned) T), 256, 0, s>>>(x, n_rot, stride, n_head, pos, base, ld);
+    rope_heads_kernel<<<dim3((n + 255) / 256, (unsigned) T), 256, 0, s>>>(x, n_rot, stride, n_head, pos, base, ld, rx);
     launch_check("rope_heads");
+}
+
+void softcap(float* x, int n, float cap, cudaStream_t s) {
+    softcap_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, n, cap);
+    launch_check("softcap");
+}
+
+void layer_norm_row(const float* x, const float* w, const float* b, int n, float eps, float* y, cudaStream_t s) {
+    layer_norm_row_kernel<<<1, 1024, 0, s>>>(x, w, b, n, eps, y);
+    launch_check("layer_norm_row");
+}
+
+void ssmax_heads(float* x, int width, int stride, int n_head, const float* s_w, const float* s_b, int pos,
+                 cudaStream_t s, int T, int ld) {
+    const int n = n_head * width;
+    ssmax_heads_kernel<<<dim3((n + 255) / 256, (unsigned) T), 256, 0, s>>>(x, width, stride, n_head, s_w, s_b, pos, ld);
+    launch_check("ssmax_heads");
 }
 
 void mla_pe(const float* q, int k_mla, int qk_nope, int n_rot, const uint16_t* wk_b, const uint16_t* wv_b,
@@ -7526,7 +7599,7 @@ void mla_pe(const float* q, int k_mla, int qk_nope, int n_rot, const uint16_t* w
                 cudaGetLastError();
         }
         if (buf[dev] == nullptr &&
-            cudaMalloc(&buf[dev], (size_t) n_head * (2 * kv_lora + qk_nope) * sizeof(float)) != cudaSuccess) {
+            cudaMalloc(&buf[dev], (size_t) n_head * (2 * kv_lora + k_mla) * sizeof(float)) != cudaSuccess) {   // (k_mla: a NoPE layer packs the whole head)
             buf[dev] = nullptr;
             cudaGetLastError();
         }

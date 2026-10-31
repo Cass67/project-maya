@@ -597,6 +597,7 @@ public:
     bool fast_layers(int64_t p, bool hop_in, std::string& err);
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
     bool fast_dsa_rope(int il, int64_t p, std::string& err);   // glm-dsa's mixer (roped MLA, token indexer)
+    bool fast_ml4_mixer(int il, int64_t p, std::string& err);  // mistral-large4's (fast_dsa_rope hands it over)
     bool fast_layers_dsa(int64_t p, std::string& err);         // glm-dsa's plain-residual layer loop
     bool fast_mtp_cache_rope(int64_t p, const float* h, const float* emb, std::string& err);
     // the residual's layout: glm5-next's 4 mHC streams, glm-dsa's one (embedding in; output_norm + q8_1 out)

@@ -799,6 +799,27 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.dt_bias = f32("ssm_dt.bias");
             Ly.ssm_a = f32("ssm_a");
             Ly.ssm_norm = f32("ssm_norm.weight");
+        } else if (g.ml4) {   // mistral-large4: attn_q from x; kv_a on a KV-owning layer, the indexer on a full one
+            Ly.q_b = q("attn_q.weight");
+            if (g.kv_of(il) == il) {
+                Ly.kv_a = q_or_b16("attn_kv_a_mqa.weight", g.n_embd, g.kv_lora);
+                Ly.kv_a_norm = f32("attn_kv_a_norm.weight");
+            }
+            Ly.ssmax_w = f32("attn_ssmax.weight");
+            Ly.ssmax_b = f32("attn_ssmax.bias");
+            if (g.indexer_full[(size_t) il]) {
+                Ly.idx_q_norm_w = f32("indexer.q_norm.weight");
+                Ly.idx_q_norm_b = f32("indexer.q_norm.bias");
+                Ly.idx_ssmax_w = f32("indexer.ssmax.weight");
+                Ly.idx_ssmax_b = f32("indexer.ssmax.bias");
+                Ly.k_norm_w = f32("indexer.k_norm.weight");
+                Ly.k_norm_b = f32("indexer.k_norm.bias");
+                Ly.idx_k = b16("indexer.attn_k.weight");
+                Ly.idx_q_b = b16("indexer.attn_q_b.weight");
+                Ly.idx_proj = b16("indexer.proj.weight");
+            }
+            Ly.k_b = b16("attn_k_b.weight");
+            Ly.v_b = b16("attn_v_b.weight");
         } else {
             Ly.q_a = q_or_b16("attn_q_a.weight", g.n_embd, g.q_lora);
             Ly.q_b = q("attn_q_b.weight");
@@ -826,7 +847,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.out = q("attn_output.weight");
         if (Ly.moe) {
             Ly.router = b16("ffn_gate_inp.weight");
-            Ly.router_bias = f32("exp_probs_b.bias");
+            if (!g.ml4) Ly.router_bias = f32("exp_probs_b.bias");   // (mistral-large4: softmax, no selection bias)
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
             Ly.sh_down = q("ffn_down_shexp.weight");
@@ -874,16 +895,17 @@ bool Glm5Model::fast_setup(std::string& err) {
 
     // ---- the activation arena
     const int64_t E = g.n_embd, DI = g.d_inner(), FF = g.n_ff_exp * g.n_shared;
+    const int64_t QR = g.ml4 ? E : g.q_lora;   // qr (mistral-large4: the indexer q's layer_norm(x))
     const int64_t max_pools = std::max<int64_t>(1, max_ctx_ / g.idx_kpool);
     const size_t q8 = 36;   // bytes per q8_1 block
     size_t need = 0;
     {
         // generous upper bound, carved below
-        need = (size_t) (4 * E + 64 + 32 * 26 + 128 + 6 * DI + 4 * 128 + 2 * DI + 2 * g.q_lora + 2 * (g.kv_lora + g.n_rot) +
+        need = (size_t) (4 * E + 64 + 32 * 26 + 128 + 6 * DI + 4 * 128 + 2 * DI + 2 * QR + 2 * (g.kv_lora + g.n_rot) +
                          4 * g.idx_key + 64 + (int64_t) g.n_head * g.k_mla() + (int64_t) g.n_head * (g.kv_lora + g.v_head) + (int64_t) g.idx_heads * g.idx_key +
                          max_pools + g.n_sel_max() + 2 * g.n_expert + 2 * FF + 2 * g.n_ff_dense + 2 * E + 64) *
                    sizeof(float);
-        need += (size_t) (E + DI + g.q_lora + (int64_t) g.n_head * g.v_head + FF + 8 * g.n_ff_exp + g.n_ff_dense + E) /
+        need += (size_t) (E + DI + QR + (int64_t) g.n_head * g.v_head + FF + 8 * g.n_ff_exp + g.n_ff_dense + E) /
                 32 * q8;
         need += 64 * 256 + (size_t) (2 * NL * g.n_expert + NL * gf::kSpares) * sizeof(unsigned long long) +
                 8 * 16 + gf::kMaxEmbd * 4 + 4 * 256 + (size_t) g.n_expert * 4 + 256 + 4 * 256;
@@ -915,8 +937,8 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->g2 = fa_take(at, DI);
     F->gated_q = fa_take_b(at, (size_t) DI / 32 * q8);
     F->qr_raw = fa_take(at, g.q_lora);
-    F->qr = fa_take(at, g.q_lora);
-    F->qr_q = fa_take_b(at, (size_t) g.q_lora / 32 * q8);
+    F->qr = fa_take(at, QR);
+    F->qr_q = fa_take_b(at, (size_t) QR / 32 * q8);
     F->kv_raw = fa_take(at, g.kv_lora + g.n_rot);   // (glm-dsa: [latent | k_pe])
     F->ik_raw = fa_take(at, g.idx_key);
     F->ig_raw = fa_take(at, g.idx_key);
@@ -5899,7 +5921,7 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
                       const float w = F->miss_w_req >= 0.0f ? F->miss_w_req : F->miss_w;
                       const int from = F->miss_from_req >= 0 ? F->miss_from_req : F->miss_from;
                       return il >= from ? w : 0.0f;
-                  }(), win_rows);
+                  }(), win_rows, g.ml4);
 }
 
 bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias,
@@ -6050,6 +6072,7 @@ bool Glm5Model::fast_mtp_cache_rope(int64_t p, const float* h, const float* emb,
 // -> F->mixer.  A full indexer layer scores every visible token and keeps top_k (all of them while p + 1 <= top_k);
 // a shared one reuses the previous full layer's cells (F->cells, F->dsa_n_sel).
 bool Glm5Model::fast_dsa_rope(int il, int64_t p, std::string& err) {
+    if (g_.ml4) return fast_ml4_mixer(il, p, err);
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -6134,6 +6157,92 @@ bool Glm5Model::fast_dsa_rope(int il, int64_t p, std::string& err) {
     gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head, g.n_embd};
     if (!gf::mv(&o, 1, s)) { err = "glm fast: dsa output"; return false; }
     if (F->prof_on) F->mark("dsa_out_mv");
+    return true;
+}
+
+// ---- mistral-large4 (ref/ml4.py Ml4.attention): fast_dsa_rope's mixer without q_lora (q = attn_q x), NoPE layers (the
+// whole head absorbed, no k_pe), a KV source's cache read in place of a layer's own, SSMax applied to each q head before
+// the absorb / rope (both linear: the same as ref's scaling of q_abs and q_pe after them), YaRN + rope_freqs
+bool Glm5Model::fast_ml4_mixer(int il, int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    const auto& Ly = F->L[(size_t) il];
+    if (kv_streamed(kv_, il) || kv_streamed(kv_, g.kv_of(il))) {
+        err = "glm fast: mistral-large4 with KV streaming is not ported yet";
+        return false;
+    }
+    const bool full = g.indexer_full[(size_t) il] != 0, own = g.kv_of(il) == il, rope = g.has_rope(il);
+    const int n_rot = rope ? g.n_rot : 0, qn = g.qk_nope_l(il);
+    const int n_vis = (int) p + 1;
+    const bool all = n_vis <= g.idx_top_k && gf::dsa_select_all_on();
+    gf::RopeExt rx;
+    rx.freq_scale = g.freq_scale;
+    rx.ext = g.yarn_ext;
+    rx.lo = g.yarn_lo;
+    rx.hi = g.yarn_hi;
+    rx.mscale = g.yarn_mscale;
+    if (const auto it = w_.find("rope_freqs.weight"); it != w_.end()) rx.ff = it->second;
+    gf::MvJob j[4];
+    int nj = 0;
+    j[nj++] = {Ly.q_b.q, F->xq, F->x, F->q, nullptr, 1.0f, Ly.q_b.type, g.n_embd, g.n_head * g.k_mla()};
+    if (own) j[nj++] = {Ly.kv_a.q, F->xq, F->x, F->kv_raw, nullptr, 1.0f, Ly.kv_a.type, g.n_embd, g.kv_lora + n_rot};
+    if (full) {
+        j[nj++] = {Ly.idx_k, nullptr, F->x, F->ik_raw, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.idx_key};
+        if (!all)
+            j[nj++] = {Ly.idx_proj, nullptr, F->x, F->iw, nullptr, 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads)),
+                       gf::kTypeBF16, g.n_embd, g.idx_heads};
+    }
+    if (!gf::mv(j, nj, s)) { err = "glm fast: ml4 projections"; return false; }
+    uint16_t* lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+    float* kpe = state_ + dsa_kpe_[(size_t) il];
+    float* ik = state_ + dsa_pool_[(size_t) il];
+    gf::DsaRopePrepArgs d;
+    d.kv_raw = own ? F->kv_raw : nullptr;
+    d.kv_norm = Ly.kv_a_norm;
+    d.lat = lat;
+    d.kpe = kpe;
+    d.rec = dsa_rec_;
+    d.kv_lora = g.kv_lora;
+    d.n_rot = n_rot;
+    d.ik_raw = full ? F->ik_raw : nullptr;
+    d.k_norm_w = Ly.k_norm_w;
+    d.k_norm_b = Ly.k_norm_b;
+    d.ik = ik;
+    d.idx_key = g.idx_key;
+    d.p = (int) p;
+    d.base = g.rope_base;
+    d.eps = g.norm_eps;
+    d.ln_eps = g.idx_ln_eps;
+    d.rx = rx;
+    gf::dsa_rope_prep(d, s);
+    gf::ssmax_heads(F->q, g.k_mla(), g.k_mla(), g.n_head, Ly.ssmax_w, Ly.ssmax_b, (int) p, s);
+    if (rope) gf::rope_heads(F->q + qn, g.n_rot, g.k_mla(), g.n_head, (int) p, g.rope_base, s, 1, 0, rx);
+    if (full) {
+        F->dsa_n_sel = std::min(g.idx_top_k, n_vis);
+        if (all) {
+            gf::dsa_select_all(n_vis, 1, F->dsa_n_sel, (int) p, F->cells, s);
+        } else {
+            gf::layer_norm_row(F->x, Ly.idx_q_norm_w, Ly.idx_q_norm_b, g.n_embd, g.idx_ln_eps, F->qr, s);
+            gf::MvJob iq = {Ly.idx_q_b, nullptr, F->qr, F->iq, nullptr, 1.0f, gf::kTypeBF16, g.n_embd,
+                            g.idx_heads * g.idx_key};
+            if (!gf::mv(&iq, 1, s)) { err = "glm fast: ml4 indexer q"; return false; }
+            gf::ssmax_heads(F->iq, g.idx_key, g.idx_key, g.idx_heads, Ly.idx_ssmax_w, Ly.idx_ssmax_b, (int) p, s);
+            if (rope) gf::rope_heads(F->iq, g.n_rot, g.idx_key, g.idx_heads, (int) p, g.rope_base, s, 1, 0, rx);
+            gf::dsa_score(F->iq, ik, F->iw, g.idx_key, g.idx_heads, n_vis, F->score, s, true);
+            gf::dsa_select(F->score, n_vis, 1, F->dsa_n_sel, F->dsa_n_sel, (int) p, F->cells, s);
+        }
+    } else if (F->dsa_n_sel <= 0) {
+        err = "glm fast: mistral-large4 layer " + std::to_string(il) + " shares an indexer selection this part never made";
+        return false;
+    }
+    gf::mla_pe(F->q, g.k_mla(), qn, n_rot, Ly.k_b, Ly.v_b, lat, kpe, F->cells, F->dsa_n_sel, g.n_head, g.kv_lora,
+               g.v_head, F->qabs, F->attn_q, s, dsa_rec_, dsa_rec_ / 2);
+    if (dumps) fast_dump(s, "kqv_out-" + std::to_string(il), F->qabs + (size_t) g.n_head * g.kv_lora,
+                         (int64_t) g.n_head * g.v_head);
+    gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head, g.n_embd};
+    if (!gf::mv(&o, 1, s)) { err = "glm fast: ml4 output"; return false; }
     return true;
 }
 
@@ -6476,6 +6585,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
+    if (g.softcap > 0.0f) gf::softcap(tail->sc_ + tail->sc_logits, g.n_vocab, g.softcap, FT->cs);
     gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
     cudaMemcpyAsync(FT->tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
     cudaEventRecord(FT->ev_done, FT->cs);

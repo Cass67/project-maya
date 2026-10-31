@@ -499,6 +499,9 @@ struct Glm5Model::FastState {
         const float *q_a_norm = nullptr, *kv_a_norm = nullptr, *k_norm_w = nullptr, *k_norm_b = nullptr, *ape = nullptr;
         const uint16_t *idx_k = nullptr, *idx_gate = nullptr, *idx_q_b = nullptr, *idx_proj = nullptr;
         const uint16_t *k_b = nullptr, *v_b = nullptr;
+        // mistral-large4: q_b holds attn_q (no q_lora); the indexer q's LayerNorm, SSMax of q and the indexer q
+        const float *idx_q_norm_w = nullptr, *idx_q_norm_b = nullptr;
+        const float *ssmax_w = nullptr, *ssmax_b = nullptr, *idx_ssmax_w = nullptr, *idx_ssmax_b = nullptr;
         const uint16_t* router = nullptr;
         const float* router_bias = nullptr;
         WSlot sh_gate, sh_up, sh_down;

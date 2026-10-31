@@ -371,7 +371,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                const float* const* ahead_bias = nullptr, int n_ahead = 0, int skip_from = 8,
                unsigned long long cpu_plan = 0, int promote_min = 0, int pf_rank = 0, int near_n = 0, int win = 0,
                unsigned int* scr_used = nullptr, int win_n = 0, int disk_skip_from = 8, float disk_skip_w = 0.0f,
-               float miss_skip_w = 0.0f, int win_rows = 0);
+               float miss_skip_w = 0.0f, int win_rows = 0, bool softmax = false);
 /// A verify window's MoE layer with each distinct expert computed ONCE: the T tokens were routed one after another into
 /// their own plan arrays (moe_route with win = t and a scr_used word, so no two of them land in one scratch slot - the
 /// word's bit 31 says one did), then moe_win_experts groups the entries by expert slot, reads each expert's gate/up and
@@ -458,6 +458,12 @@ bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, s
 /// the latent rms(kv_raw[:kv_lora]) * kv_norm into the FP16 cache row p, k_pe = rope(kv_raw[kv_lora:]) (NOT normed) into
 /// the F32 cache row p, and - ik_raw non-null, a full indexer layer - the indexer key layer_norm(ik_raw) * w + b (eps
 /// ln_eps), roped on its first n_rot dims, into the F32 key cache row p (a token is its own pool).
+/// mistral-large4's rope beside ggml NORM: YaRN (freq_scale, the ramp over [lo, hi] x ext) and freq_factors ff
+/// (n_rot/2 theta divisors), cos/sin x mscale.  The default is plain NORM (glm-dsa).
+struct RopeExt {
+    float freq_scale = 1.0f, ext = 0.0f, lo = 0.0f, hi = 0.0f, mscale = 1.0f;
+    const float* ff = nullptr;
+};
 struct DsaRopePrepArgs {
     const float* qr_raw = nullptr; const float* q_a_norm = nullptr; float* qr = nullptr; void* qr_q = nullptr;
     int q_lora = 2048;
@@ -476,11 +482,21 @@ struct DsaRopePrepArgs {
     // lat_slots (row lat_table[p / lat_page] * lat_page + p % lat_page when that block is resident)
     int rec = 0;
     uint16_t* lat_host = nullptr; uint16_t* lat_slots = nullptr; const int* lat_table = nullptr; int lat_page = 1;
+    RopeExt rx;   // (mistral-large4; kv_raw null: a layer reading another's KV writes none)
 };
 void dsa_rope_prep(const DsaRopePrepArgs& a, cudaStream_t s);
+/// x = cap * tanh(x / cap) over n floats (mistral-large4's final logit softcap)
+void softcap(float* x, int n, float cap, cudaStream_t s);
+/// y = layer_norm(x) * w + b over n floats (one row; mistral-large4's indexer q norm)
+void layer_norm_row(const float* x, const float* w, const float* b, int n, float eps, float* y, cudaStream_t s);
+/// SSMax (mistral-large4): head h's first `width` floats (x + stride*h, T rows ld floats apart, row t at pos + t) times
+/// s[h] * log(pos + 1) + b[h], the log as llama.cpp feeds it (1 + log in double, f32, - 1)
+void ssmax_heads(float* x, int width, int stride, int n_head, const float* s_w, const float* s_b, int pos,
+                 cudaStream_t s, int T = 1, int ld = 0);
 /// ggml rope NORM on the first n_rot floats of n_head heads (head h at x + stride * h), at position pos; T rows ld floats
 /// apart, row t at pos + t.
-void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base, cudaStream_t s, int T = 1, int ld = 0);
+void rope_heads(float* x, int n_rot, int stride, int n_head, int pos, float base, cudaStream_t s, int T = 1, int ld = 0,
+                const RopeExt& rx = RopeExt{});
 /// glm-dsa's absorbed MLA for one token: q heads of [nope (qk_nope) | rope (n_rot)] k_mla apart; scores q_abs . latent +
 /// q_pe . k_pe over the cells (nullptr: every position 0 .. n_sel-1, the dense NextN block), / sqrt(qk_nope + n_rot);
 /// out_h = wv_b_h . ctx as q8_1.  scratch: n_head x (kv_lora + v_head).
