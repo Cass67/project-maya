@@ -282,6 +282,7 @@ int moe_window_rows(size_t T, const Glm5Geometry& g) {
 // the MoE runs on the WHOLE chunk (every expert's weights are read once per chunk); the shared expert in sub-batches
 struct MoeBufs {
     float *logits, *rw, *OUTP, *OUTPc;
+    float* GUP;   // 2 * n_ff > n_embd (mistral-large4): the sets' gate/up rows here, not in their OUTP rows
     float *sh_g, *sh_u;
     uint16_t* sh16;
     int *ids, *rank, *counts, *base, *row_tok, *pos, *bounds;
@@ -327,6 +328,7 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
     // each set's gate/up rows live in its own OUTP rows until the down product, the swiglu over their gate halves
     b.OUTP = c.take<float>(W * g.n_embd);
     b.OUTPc = c.take<float>(W * g.n_embd);
+    b.GUP = 2 * g.n_ff_exp > g.n_embd ? c.take<float>(W * 2 * (size_t) g.n_ff_exp) : nullptr;
     const size_t ts = std::min(T, sub);   // the shared expert's sub-batch
     b.sh_g = c.take<float>(ts * FF);
     b.sh_u = c.take<float>(ts * FF);
@@ -3458,7 +3460,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         continue;
                     }
 #endif
-                    float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the set's own OUTP rows hold its gate/up
+                    // 2 * n_ff <= n_embd: the set's own OUTP rows hold its gate/up; wider (mistral-large4): GUP's rows
+                    float* GU = M.GUP != nullptr ? M.GUP + (size_t) o * 2 * nff : M.OUTP + (size_t) o * E;
                     if (wmma && !wmma_fell_back) {
                         // the FP16 tensor-core products: the part's rows gathered from S->x into Xq (the q8_1 sizing
                         // covers W * E halves), the FP32 gate/up split through the clamped swiglu into Hq (its q8_1
@@ -3628,7 +3631,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             else if (use_blas) run_set_q(wbase, n_exp, stride, d_bounds, hb, r0);
             else run_set(wbase, n_exp, stride, d_bounds, hb, r0);
         };
-        if (2 * nff > E) {
+        if (2 * nff > E && M.GUP == nullptr) {
             err = "glm prefill: 2 * n_ff_exp > n_embd (the gate/up rows would not fit the set's output rows)";
             return false;
         }
