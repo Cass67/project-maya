@@ -3467,6 +3467,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // so this is lossless; F32 expansion doubled their bytes and their read time) and does not upload
     // token_embd at all (the embedding row is dequantized on the host from the shard mapping)
     fast_mode_ = getenv("STRATA_GLM_SLOW") == nullptr;
+    if (g_.ml4 && fast_mode_) {
+        err = "glm pack: mistral-large4 runs on the reference path only so far (STRATA_GLM_SLOW=1)";
+        return false;
+    }
     if (exl3_ && !fast_mode_) {
         err = "pack: an EXL3 model runs on the fast path only (unset MAYA_GLM_SLOW)";
         return false;
@@ -3878,6 +3882,16 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             dsa_lat_[(size_t) il] = floats;     // every position on the full indexer layers only (shared ones reuse)
             dsa_kpe_[(size_t) il] = floats + g_.kv_lora / 2;
             floats += rec_floats * lat_rows;
+            dsa_pool_[(size_t) il] = floats;
+            if (g_.indexer_full[(size_t) il]) floats += (int64_t) g_.idx_key * max_ctx;
+        } else if (g_.dsa && g_.kv_of(il) != il) {   // mistral-large4: reads its KV source's latent / k_pe
+            if (g_.kv_of(il) < l0_) {
+                err = "glm pack: mistral-large4 layer " + std::to_string(il) + " reads layer " +
+                      std::to_string(g_.kv_of(il)) + "'s KV, which another GPU holds - split after it, not between";
+                return false;
+            }
+            dsa_lat_[(size_t) il] = dsa_lat_[(size_t) g_.kv_of(il)];
+            dsa_kpe_[(size_t) il] = dsa_kpe_[(size_t) g_.kv_of(il)];
             dsa_pool_[(size_t) il] = floats;
             if (g_.indexer_full[(size_t) il]) floats += (int64_t) g_.idx_key * max_ctx;
         } else if (g_.dsa) {   // the latent (F32 on the reference path), F32 k_pe and indexer keys of every position
