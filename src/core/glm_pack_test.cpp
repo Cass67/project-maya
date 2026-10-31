@@ -535,5 +535,25 @@ int main(int argc, char** argv) {
     if (mtp_probe)
         std::printf("mtp: draft == next argmax %d/%d (%.1f%%)\n", mtp_ok, mtp_n, 100.0 * mtp_ok / std::max(1, mtp_n));
     std::fprintf(stderr, "glm_pack_test: PASS (%d tokens streamed)\n", n_tok);
+    // GLM_TEST_GEN=N: then N greedy tokens on from the teacher-forced ones (the plain decode's speed)
+    if (const char* gv = getenv("GLM_TEST_GEN")) {
+        strata::kernels::SamplerParams sp;
+        sp.temperature = 0;
+        sp.greedy = true;
+        const int count = std::atoi(gv);
+        std::vector<float> lg;
+        std::string gen;
+        const auto begin = std::chrono::steady_clock::now();
+        for (int i = 0; i < count; ++i) {
+            const int tok = model.sample_token(sp, err);
+            if (tok < 0 || !model.forward({tok}, lg, err)) {
+                std::fprintf(stderr, "gen: %s\n", err.c_str());
+                return 1;
+            }
+            gen += (i ? "," : "") + std::to_string(tok);
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        std::printf("GEN tokens=%d tok_s=%.3f ms_tok=%.1f ids=%s\n", count, count * 1000.0 / ms, ms / count, gen.c_str());
+    }
     return 0;
 }
