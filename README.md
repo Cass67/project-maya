@@ -67,9 +67,9 @@ Both branches build on either backend, but the batched prompt path these ports a
 in `mla_attn_wmma2`, a HIP kernel.
 
 - **AMD (HIP)**: full speed, batched prompts.
-- **NVIDIA (CUDA)**: decode is unaffected, but a prompt that takes the batched path stops with
-  `glm prefill: the glm-dsa prompt attention is HIP only`. Set `STRATA_GLM_NO_PREFILL=1` (or `--prefill 0`) to read
-  prompts a token at a time instead.
+- **NVIDIA (CUDA)**: works out of the box - the engine sees the batched path is HIP-only and reads prompts a token
+  at a time (`glm prefill: the batched prompt path is HIP only - the prompt runs token by token`). Decode is
+  unaffected; prompt processing is slower.
 
 Porting that one kernel to CUDA - `mla_attn_wmma2_kernel` in `src/kernels/cuda/glm_batch.cu`, HIP wmma to
 `nvcuda::wmma` - is what would let a CUDA build run the batched path.
