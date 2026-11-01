@@ -1059,6 +1059,11 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 bool Glm5Model::prefill_setup(std::string& err) {
     (void) err;
     if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
+#if !defined(STRATA_USE_HIP)
+    // The batched prompt path ends in mla_attn_wmma2, a HIP kernel: a CUDA build reads prompts token by token.
+    std::fprintf(stderr, "glm prefill: the batched prompt path is HIP only - the prompt runs token by token\n");
+    return true;
+#endif
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
         return true;
