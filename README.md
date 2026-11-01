@@ -43,6 +43,24 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 The setup asks which model you want, downloads it, builds everything once and **starts the model**. Then open
 `http://127.0.0.1:8080`. Windows: `START-MAYA.bat` instead of `./setup.sh`. More in [Install](#install).
 
+## Which branch do I build?
+
+`main` tracks upstream [mw00/project-maya](https://github.com/mw00/project-maya). The newer model ports live on
+their own branches. Each one is a complete, buildable tree - clone the branch you want and run `./setup.sh` exactly
+as above.
+
+| Branch | Adds |
+| --- | --- |
+| `main` | GLM-5.3-Flash and DeepSeek-V4.1-Flash-1017, tracking upstream |
+| `glm53-port` | GLM-5.3-Flash on the glm-dsa engine: batched prompt path, MTP drafting from the NextN block, 256K context with the KV cache in RAM, split decode attention, expert prestage on GPU splits |
+| `ml4-port` | Mistral Large 4 (`maya-ml4-q4xl`) on the same engine, plus the GLM-5.3 work above - the newest port |
+| `ds4-stream-win` | DeepSeek-V4.1 on Windows: the verify windows' CPU-lane picks stream over PCIe as well (`DS4_STREAM_WIN`, opt-in) |
+
+```sh
+git clone -b ml4-port https://github.com/Cass67/project-maya.git && cd project-maya
+./setup.sh
+```
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>Pick your model
 
 Every Maya quant is named after its model, then its tier - XS, S, M or L, by how many bits its experts keep. The setup
