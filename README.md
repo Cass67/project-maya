@@ -63,15 +63,16 @@ git clone -b ml4-port https://github.com/Cass67/project-maya.git && cd project-m
 
 ### NVIDIA or AMD
 
-Both branches build on either backend; what differs is how a prompt is read.
+Both branches build on either backend, but the batched prompt path these ports add is **AMD-only for now**: it ends
+in `mla_attn_wmma2`, a HIP kernel.
 
-- **AMD (HIP)** runs the fast batched prompt path these ports add.
-- **NVIDIA (CUDA)** builds and runs too, but that path multiplies its experts with MMQ, which is HIP-only. Setup
-  prints `this build has no MMQ kernels - the prompt runs token by token` and reads prompts a token at a time.
-  Decode speed is unaffected and no setting is needed.
+- **AMD (HIP)**: full speed, batched prompts.
+- **NVIDIA (CUDA)**: decode is unaffected, but a prompt that takes the batched path stops with
+  `glm prefill: the glm-dsa prompt attention is HIP only`. Set `STRATA_GLM_NO_PREFILL=1` (or `--prefill 0`) to read
+  prompts a token at a time instead.
 
-Moving the batched path to CUDA is one kernel - `mla_attn_wmma2_kernel` in `src/kernels/cuda/glm_batch.cu`, HIP wmma
-to `nvcuda::wmma` - and nothing else. Until then, CUDA builds read prompts on the token path.
+Porting that one kernel to CUDA - `mla_attn_wmma2_kernel` in `src/kernels/cuda/glm_batch.cu`, HIP wmma to
+`nvcuda::wmma` - is what would let a CUDA build run the batched path.
 
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>Pick your model
 
