@@ -559,10 +559,11 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
     const bool lane = (F->cpu_plan != 0ull || F->helper.device() >= 0) && F->cpu_fmt[(size_t) il].n_ff > 0;
     // STRATA_GLM_TRUNK_KEEP / _MAP: a window token leaves out the same experts the token path would (8: none)
     const int keep = il == mtp_il_ ? 8 : glmfast::trunk_skip_from(il);
-    static const int promote_min = [] {
+    static const int configured_promote_min = [] {
         const char* v = getenv("STRATA_GLM_PROMOTE_MIN");
         return v ? std::max(0, std::atoi(v)) : 0;
     }();
+    const int promote_min = F->diagnostic_cache_mode < 0 ? 2147483647 : configured_promote_min;
     const float* ah_bias[gf::kAhead] = {nullptr, nullptr, nullptr, nullptr};
     // the batched window's routes on two window lanes (both sockets' pools answer it, win_lane): every RAM-tier expert
     // to the CPU - the calibrated plan priced one pool against PCIe, and a merged layer has two (a 3090's 2.1 ms PCIe
@@ -621,7 +622,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
                           g.norm_w != 0, il, W.x + (size_t) t * E, E, mt, W.sh_g + (size_t) t * FFs,
                           W.sh_u + (size_t) t * FFs, g.swiglu_shexp, FFs, (uint8_t*) W.sh_hq + (size_t) t * W.sh_hq_s, s,
                           nullptr, nullptr, 0, nullptr, ah_bias, 0, keep, lane ? win_plan : 0ull, promote_min, 0, 0, t,
-                          scr, t0 + T);
+                          scr, t0 + T, 8, 0.0f, 0.0f, 0, g.ml4);
             ++F->expected;
             // (every expert in VRAM: the wait and the fetch are no-ops - fast_moe's all_resident, 2 launches a token)
             if (!F->all_resident) {
@@ -776,7 +777,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
         gf::moe_route(W.rlog + (size_t) t * g.n_expert, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale,
                       g.norm_w != 0, il, x, E, md, W.sh_g + (size_t) t * FFs, W.sh_u + (size_t) t * FFs,
                       g.swiglu_shexp, FFs, F->sh_hq, s, nullptr, nullptr, 0, nullptr, ah_bias, 0, keep,
-                      lane ? F->cpu_plan : 0ull, promote_min);
+                      lane ? F->cpu_plan : 0ull, promote_min, 0, 0, 0, nullptr, 0, 8, 0.0f, 0.0f, 0, g.ml4);
         ++F->expected;
         if (!F->all_resident) {
             gf::moe_wait(md, E, s);
@@ -898,7 +899,7 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
             ~Restore() { f->x = x; f->mixer = mixer; f->xq = xq; f->cells = cells; f->dsa_n_sel = n_sel; }
         } restore{F, F->x, F->mixer, F->xq, F->cells, F->dsa_n_sel};
         float* R = W.R[0];
-        if (kvm_host_ != nullptr && !kvm_writer_)   // mistral-large4: the KV source's records of the rows, earlier part's
+        if (kvm_host_ != nullptr && !kvm_writer_ && !kv_streamed(kv_, kvm_src_))   // mistral-large4: the KV source's records of the rows, earlier part's
             cudaMemcpyAsync((uint16_t*) (state_ + dsa_lat_[(size_t) kvm_src_]) + (size_t) p0 * dsa_rec_,
                             kvm_host_ + (size_t) p0 * dsa_rec_, (size_t) T * dsa_rec_ * sizeof(uint16_t),
                             cudaMemcpyHostToDevice, s);
@@ -1162,6 +1163,9 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         err = "glm window: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
+    // Match the serial head before sampling; greedy picks alone cannot detect
+    // a missing monotone softcap (Mistral Large 4 uses cap 30).
+    if (g.softcap > 0.0f) gf::softcap(WT.logits, T * g.n_vocab, g.softcap, FT->cs);
     if (sp != nullptr && (!sp->greedy || sp->penalty_last_n > 0)) {
         // row t is drawn with the counter the token loop would use for the token after tokens[t] (and, with
         // penalties, the history it would count: tokens[1..t] after what came before)
@@ -1366,6 +1370,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
             err = "glm window: output head (type " + std::to_string(ow.type) + ")";
             return false;
         }
+        if (g.softcap > 0.0f) gf::softcap(lg, g.n_vocab, g.softcap, F->cs);
         if (W.pick_sampled) {
             strata::kernels::SamplerParams sp = W.pick_sp;
             sp.counter += (uint64_t) t;
@@ -1377,6 +1382,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     }
     gf::set_skip(nullptr);
     cudaMemcpyAsync(W.tok_h + sl, W.tok + sl, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
+    if (F->prof_on) F->mark("head_sample");
     cudaEventRecord(W.ev_pick[sl], F->cs);
     return true;
 }
@@ -1408,6 +1414,7 @@ bool Glm5Model::win_head_split(int t, int sl, const float* hx, float* lg, std::s
     const WSlot& hw = h->ws_map_.at("output.weight.hi");
     const gf::MvJob oh = {hw.q, nullptr, hxd, hlg, nullptr, 1.0f, hw.type, E, nc};
     const bool ok_h = gf::mv(&oh, 1, h->hh_s_);
+    if (g.softcap > 0.0f) gf::softcap(hlg, nc, g.softcap, h->hh_s_);
     if (W.pick_sampled) {
         cudaMemcpyAsync(ht_lg_h_ + (size_t) sl * nc, hlg, (size_t) nc * sizeof(float), cudaMemcpyDeviceToHost, h->hh_s_);
     } else {
@@ -1430,6 +1437,7 @@ bool Glm5Model::win_head_split(int t, int sl, const float* hx, float* lg, std::s
         err = "glm window: the head's half";
         return false;
     }
+    if (g.softcap > 0.0f) gf::softcap(lg, c0, g.softcap, F->cs);
     if (W.pick_sampled) {
         cudaStreamWaitEvent(F->cs, h->hh_ev_[sl], 0);
         cudaMemcpyAsync(lg + c0, ht_lg_h_ + (size_t) sl * nc, (size_t) nc * sizeof(float), cudaMemcpyHostToDevice, F->cs);
@@ -1458,6 +1466,7 @@ bool Glm5Model::win_head_split(int t, int sl, const float* hx, float* lg, std::s
             const gf::MvJob of = {ow.q, nullptr, hx, clg, nullptr, 1.0f, ow.type, E, V};
             gf::set_skip(nullptr);
             gf::mv(&of, 1, F->cs);
+            if (g.softcap > 0.0f) gf::softcap(clg, V, g.softcap, F->cs);
             gf::argmax(clg, V, ctok, F->cs);
             gf::set_skip(W.from != nullptr ? W.skip_d : nullptr);
             cudaMemcpyAsync(pair_h, W.tok + sl, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
@@ -1782,6 +1791,29 @@ bool Glm5Model::window_pipe(const int32_t* tokens, int T, int32_t* out, std::str
     if (!win_pipe_end(out, err)) return false;
     hlap(WH.h_wait);
     if (hprof) ++WH.h_n;
+    return true;
+}
+
+bool Glm5Model::window_logits(std::vector<float>& rows, std::string& err) {
+    if (fast_ == nullptr || fast_->win.T < 1) {
+        err = "glm window logits: no completed window";
+        return false;
+    }
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    auto& W = tail->fast_->win;
+    const size_t count = (size_t) fast_->win.T * g_.n_vocab;
+    const size_t offset = W.piped ? (size_t) W.bank * kPipeMax * g_.n_vocab : 0;
+    rows.resize(count);
+    cudaSetDevice(tail->dev_);
+    auto status = cudaStreamSynchronize(tail->fast_->cs);
+    if (status == cudaSuccess)
+        status = cudaMemcpy(rows.data(), W.logits + offset, count * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaSetDevice(dev_);
+    if (status != cudaSuccess) {
+        err = std::string("glm window logits: ") + cudaGetErrorString(status);
+        return false;
+    }
     return true;
 }
 

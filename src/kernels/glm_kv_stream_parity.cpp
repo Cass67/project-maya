@@ -259,6 +259,41 @@ void run(bool q8, int N, int P1, int P2, int n_slots, uint32_t seed) {
     cudaFreeHost(host_h);
     cudaStreamDestroy(s);
 }
+// Remote writers cannot update a reader GPU's slots. Check refresh across a
+// page boundary, absent pages, and overwritten speculative rows.
+void refresh_test(int page) {
+    constexpr int row = 1280;
+    const int rows = 3 * page;
+    uint8_t *host_h = nullptr, *host = nullptr;
+    ck(cudaHostAlloc((void**) &host_h, (size_t) rows * row, cudaHostAllocMapped | cudaHostAllocPortable), "refresh host");
+    ck(cudaHostGetDevicePointer((void**) &host, host_h, 0), "refresh mapped pointer");
+    uint8_t* slots = dalloc<uint8_t>((size_t) 2 * page * row);
+    k::KvStreamMap map;
+    map.page_table = dalloc<int32_t>(3);
+    const int32_t table[] = {1, -1, 0};
+    ck(cudaMemcpy(map.page_table, table, sizeof(table), cudaMemcpyHostToDevice), "refresh map");
+    std::vector<uint8_t> expected((size_t) 2 * page * row, 0);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int p = 0; p < rows; ++p)
+            std::memset(host_h + (size_t) p * row, 17 + p + 50 * pass, row);
+        const int first = pass == 0 ? page - 1 : 0;
+        const int count = pass == 0 ? rows - first : 1;
+        gf::glm_kv_refresh(map, host, slots, row, page, first, count, nullptr);
+        ck(cudaDeviceSynchronize(), "refresh launch");
+        for (int p = first; p < first + count; ++p)
+            if (table[p / page] >= 0)
+                std::memcpy(expected.data() + ((size_t) table[p / page] * page + p % page) * row,
+                            host_h + (size_t) p * row, row);
+        std::vector<uint8_t> actual(expected.size());
+        ck(cudaMemcpy(actual.data(), slots, actual.size(), cudaMemcpyDeviceToHost), "refresh download");
+        if (actual != expected) fail("remote KV refresh page " + std::to_string(page) + " pass " + std::to_string(pass));
+    }
+    cudaFree(slots);
+    cudaFree(map.page_table);
+    cudaFreeHost(host_h);
+    std::printf("glm_kv_stream_parity remote refresh: page %d, missing pages and rewritten rows checked\n", page);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -267,6 +302,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "glm_kv_stream_parity: run with --selftest (the CTest form)\n");
         return 2;
     }
+    refresh_test(1);
+    refresh_test(4);
     // 1,100 slots (the fewest a resolve allows is 1,024) against selections of up to 513 blocks: constant evictions
     run(false, 6002, 2001, 4003, 1100, 7u);
     run(true, 6002, 2001, 4003, 1100, 8u);

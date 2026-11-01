@@ -2429,7 +2429,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         return -1;
     };
     const auto kv_prefetch = [&](int il) -> bool {
-        if (S->kv_ss == nullptr || kv_ == nullptr || p0 <= 0 || il < 0 || kv_->host[(size_t) il] == nullptr) return true;
+        if (S->kv_ss == nullptr || kv_ == nullptr || p0 <= 0 || il < 0 || kv_->host[(size_t) il] == nullptr ||
+            (g.ml4 && g.kv_of(il) != il)) return true;
         if (!glmfast::cuda_ok(cudaEventRecord(S->kv_free, s), "glm prefill: the KV stage", err) ||
             !glmfast::cuda_ok(cudaStreamWaitEvent(S->kv_ss, S->kv_free, 0), "glm prefill: the KV stage", err) ||
             !glmfast::cuda_ok(cudaMemcpyAsync(S->kv_stage, kv_->host[(size_t) il], kv_stage_bytes(), cudaMemcpyDefault,
@@ -2492,7 +2493,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     prestage(next_moe(l0_));   // (the dense layers before the first MoE one run meanwhile)
     for (auto& t : S->tr) t.on = false;
     bool dsa_sel = false;   // (glm-dsa: this chunk's rows hold a full indexer layer's selection)
-    if (kvm_host_ != nullptr && !kvm_writer_)   // mistral-large4: the KV source's records of this chunk, from the earlier part
+    if (kvm_host_ != nullptr && !kvm_writer_ && !kv_streamed(kv_, kvm_src_))   // mistral-large4: the KV source's records of this chunk, from the earlier part
         cudaMemcpyAsync((uint16_t*) (state_ + dsa_lat_[(size_t) kvm_src_]) + (size_t) p0 * dsa_rec_,
                         kvm_host_ + (size_t) p0 * dsa_rec_, (size_t) T * dsa_rec_ * sizeof(uint16_t),
                         cudaMemcpyHostToDevice, s);
@@ -2512,20 +2513,25 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // chunk starting inside one finds it complete), which the chunk's rows are written into too and the attention
         // reads; the host copy and the resident slots get the chunk's rows as well (dsa_prep)
         uint8_t* const kv_host = !Ly.recr && kv_ != nullptr ? kv_->host[(size_t) il] : nullptr;
-        if (kv_host != nullptr && p0 > 0) {
+        if (kv_host != nullptr && (p0 > 0 || (g.ml4 && g.kv_of(il) != il))) {
             if (S->kv_next == il) {   // staged on kv_ss meanwhile
                 if (!glmfast::cuda_ok(cudaStreamWaitEvent(s, S->kv_ready, 0), "glm prefill: the KV stage wait", err))
                     return false;
                 S->kv_next = -1;
                 S->mark("kv_wait", s);
             } else {
-                if (!glmfast::cuda_ok(cudaMemcpyAsync(S->kv_stage, kv_host, kv_stage_bytes(), cudaMemcpyDefault, s),
+                const size_t bytes = g.ml4 && g.kv_of(il) != il
+                    ? (size_t) (p0 + T) * kv_->row_bytes : kv_stage_bytes();
+                if (!glmfast::cuda_ok(cudaMemcpyAsync(S->kv_stage, kv_host, bytes, cudaMemcpyDefault, s),
                                       "glm prefill: the KV stage", err))
                     return false;
                 S->mark("kv_stage", s);
             }
         }
         uint16_t* const lat = kv_host != nullptr ? (uint16_t*) S->kv_stage : (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+        if (kv_host != nullptr && g.ml4 && g.kv_of(il) < l0_)
+            gf::glm_kv_refresh(kv_->map[(size_t) il], kv_host,
+                               (uint8_t*) (state_ + dsa_lat_[(size_t) il]), kv_->row_bytes, kv_->page, p0, T, s);
 
         // ---- the mixer, in sub-batches of S->sub tokens (the recurrences carry their state across)
         if (g.dsa) for (int t0 = 0; t0 < T; t0 += S->sub) {

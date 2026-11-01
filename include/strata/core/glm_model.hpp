@@ -157,6 +157,8 @@ public:
         double all_gb = 0;   // every routed expert of this model, in GB (the Monitor's SSD-only share is what VRAM and RAM do not hold)
     };
     FastStats fast_stats() const;
+    /// Diagnostic only: drain, optionally report prior stage timings per output, reset, then toggle events.
+    void fast_profile(bool enabled, const char* label = nullptr, int outputs = 0);
     /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
     /// and free memory now, its PCI address (the server finds the GPU NVML numbers by it), the dense weights, the
     /// sequence state (the DSA latent cache, KDA states, indexer keys; kv_ram: KV streaming's pinned copy in RAM), the
@@ -198,6 +200,8 @@ public:
     /// Between requests: over decode's first windows of lane work, a split the start-up timing chose is planned again
     /// from the lane's own cost in decode when that is >15% off (at most three times; STRATA_GLM_CPU_RETIME=0: never)
     void lane_retime();
+    // Diagnostic, between requests: -1 freezes residency, 0 restores policy, 1 warms via background swaps.
+    bool diagnostic_expert_cache(int mode, std::string& err);
     bool set_pcie_share(double share);
     int cpu_lane_threads() const;
     int cpu_lane_threads_max() const;
@@ -353,6 +357,7 @@ private:
     int kvm_src_ = -1;
     bool kvm_writer_ = false;
     uint16_t* kvm_host_ = nullptr;
+    bool kvm_owned_ = false;   // streamed mirrors borrow the source KvStream allocation
     int dsa_rec_ = 0;                             // glm-dsa fast path: a cell's record in halves, [latent FP16 | k_pe
                                                   // F32] (dsa_kpe_ points into the first record); 0 = separate caches
 
@@ -959,6 +964,8 @@ public:
     /// the other).  Same picks and the same window_commit.
     bool window_pipe(const int32_t* tokens, int T, int32_t* out, std::string& err,
                      const strata::kernels::SamplerParams* sp = nullptr);
+    /// Diagnostic copy of the completed window's capped head rows, before commit or the next forward.
+    bool window_logits(std::vector<float>& rows, std::string& err);
     /// window_pipe in steps: win_pipe_begin queues the first token's pass (`sp` not greedy: the picks are draws; not
     /// `fresh`: it follows the previous window's late tokens without waiting for the devices), win_pipe_push each
     /// further token's (kPipeMax in all), win_pipe_pick(t) waits for the pick after token t; then win_pipe_settle

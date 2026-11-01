@@ -885,7 +885,7 @@ Glm5Model::~Glm5Model() {
     ckpt_join();
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
-    if (kvm_writer_ && kvm_host_ != nullptr) cudaFreeHost(kvm_host_);
+    if (kvm_owned_ && kvm_host_ != nullptr) cudaFreeHost(kvm_host_);
     if (!seq_.empty()) {   // STRATA_GLM_SEQS: sequence 0 goes back to the members (freed below), the others here
         seq_bind(0);
         for (size_t s = 0; s < seq_.size(); ++s) {
@@ -1161,6 +1161,11 @@ Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::
     namespace k = strata::kernels;
     std::vector<int> ls = dsa_layers();
     if (g_.dsa) std::erase(ls, mtp_il_);   // (glm-dsa's NextN block attends every position: its cache stays resident)
+    if (g_.ml4) {   // one host cache / residency map per KV source, including this part's remote mirror
+        for (int& il : ls) il = g_.kv_of(il);
+        std::sort(ls.begin(), ls.end());
+        ls.erase(std::unique(ls.begin(), ls.end()), ls.end());
+    }
     if (ls.empty()) return nullptr;
     auto* K = new KvStream();
     K->page = g_.idx_kpool;
@@ -1217,6 +1222,11 @@ Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::
         m.n_blocks = K->n_blocks;
         m.n_slots = K->slots;
         k::kv_stream_reset(m, nullptr);
+    }
+    if (g_.ml4) for (int il = l0_; il < l1_; ++il) {
+        const size_t src = (size_t) g_.kv_of(il);
+        K->host[(size_t) il] = K->host[src];
+        K->map[(size_t) il] = K->map[src];
     }
     if (cudaDeviceSynchronize() != cudaSuccess) return fail("KV streaming: the residency maps did not reset");
     std::fprintf(stderr, "glm pack: CUDA%d KV streaming: %lld of %lld positions of each of %zu DSA layers in VRAM (%.2f "
@@ -1621,6 +1631,19 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             split_next_.reset();
             return false;
         }
+        if (w->kv_ != nullptr && w->kv_->host[(size_t) r->kvm_src_] != nullptr) {
+            // The writer's mapped host records are authoritative. Readers retain their own device maps/slots.
+            if (r->kv_ == nullptr) {
+                err = "glm split: streamed KV source requires a streamed reader";
+                return false;
+            }
+            w->kvm_src_ = r->kvm_src_;
+            w->kvm_writer_ = true;
+            w->kvm_host_ = (uint16_t*) w->kv_->host[(size_t) r->kvm_src_];
+            r->kv_->host[(size_t) r->kvm_src_] = (uint8_t*) w->kvm_host_;
+            for (int il = r->l0_; il < r->l1_; ++il)
+                if (r->g_.kv_of(il) == r->kvm_src_) r->kv_->host[(size_t) il] = (uint8_t*) w->kvm_host_;
+        }
         if (w->kvm_host_ == nullptr) {
             cudaSetDevice(w->dev_);
             if (cudaHostAlloc((void**) &w->kvm_host_, (size_t) w->max_ctx_ * w->dsa_rec_ * sizeof(uint16_t),
@@ -1633,6 +1656,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             }
             w->kvm_src_ = r->kvm_src_;
             w->kvm_writer_ = true;
+            w->kvm_owned_ = true;
             std::fprintf(stderr, "glm split: layer %d's KV mirrored from CUDA%d to the parts after it (%.1f MB pinned)\n",
                          w->kvm_src_, w->dev_, (double) w->max_ctx_ * w->dsa_rec_ * 2 / 1048576.0);
         }

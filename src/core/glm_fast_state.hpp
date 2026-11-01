@@ -297,6 +297,13 @@ private:
     }
     void loop_c(int id) {
         for (;;) {
+            // Disabled workers sleep separately: waking them for every batch defeats a smaller active pool.
+            if (id + 1 >= active_.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(mu_);
+                idle_cv_.wait(lk, [&] { return quit_.load() || id + 1 < active_.load(std::memory_order_acquire); });
+                if (quit_.load()) return;
+                continue;
+            }
             const auto t0 = std::chrono::steady_clock::now();
             int spins = 0;
             for (;;) {
@@ -656,6 +663,7 @@ struct Glm5Model::FastState {
         cudaEvent_t ev;
     };
     std::vector<BgMove> bg;
+    int diagnostic_cache_mode = 0;
     bool bg_hold = false;   // lend_tail: no new moves while the pool's tail is lent
     volatile int* route_error_h = nullptr;   // in the mapped ring allocation, visible after compute completion
     uint64_t bg_up = 0, bg_down = 0;

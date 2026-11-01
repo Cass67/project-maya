@@ -3040,8 +3040,10 @@ static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int threads) {
     }();
     std::lock_guard<std::mutex> lk(mu);
     std::shared_ptr<glmfast::Workers> p = held.lock();
-    if (p == nullptr || p->size() != threads) {
-        p = std::make_shared<glmfast::Workers>(threads - 1, 20000, std::vector<int>{}, concurrent);
+    const char* mx = getenv("STRATA_GLM_CPU_LANE_MAX");
+    const int capacity = mx ? std::max(threads, std::min(64, std::atoi(mx))) : threads;
+    if (p == nullptr || p->size() != capacity) {
+        p = std::make_shared<glmfast::Workers>(capacity - 1, 20000, std::vector<int>{}, concurrent);
         held = p;
     }
     return p;
@@ -3296,6 +3298,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // the service thread is the pool's last worker; idle workers spin 20 ms (a decode's routes come ~1 ms apart)
     if (shared) {
         F->cpu_pool = shared_cpu_pool(threads);
+        F->cpu_pool->set_active(threads);
+        F->cpu_threads0 = threads;
     } else {
         // STRATA_GLM_CPU_LANE_MAX=N, more than the lane's count: the pool holds N threads and starts with the lane's
         // count active (the rest sleep), so a request's cpu_threads can try up to N without a restart - the setup's
@@ -4413,6 +4417,49 @@ double Glm5Model::pcie_share() const {
     return fast_ != nullptr && fast_->cpu_pool != nullptr ? plan_share(fast_->cpu_plan) : 1.0;
 }
 
+bool Glm5Model::diagnostic_expert_cache(int mode, std::string& err) {
+    win_pipe_drain();
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (m->fast_) m->fast_->diagnostic_cache_mode = mode == 0 ? 0 : -1;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        FastState* F = m->fast_;
+        if (!F) continue;
+        cudaSetDevice(m->dev_);
+        // Finish all copies, then retire their table updates with new moves disabled.
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "cache mode compute", err) ||
+            !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "cache mode copy", err) ||
+            !m->fast_boundary(err) ||
+            !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "cache mode tables", err)) return false;
+        if (mode > 0) {
+            // Discard measured-continuation history before selecting prompt-warm experts.
+            std::fill(F->cnt.begin(), F->cnt.end(), 0u);
+            std::fill(F->usage.begin(), F->usage.end(), 0u);
+            if (F->dcnt_d && !glmfast::cuda_ok(cudaMemsetAsync(F->dcnt_d, 0,
+                    (size_t)F->n_keys * sizeof(unsigned int), F->cs), "cache reset route counts", err)) return false;
+        }
+        uint64_t hash = 1469598103934665603ull;
+        size_t residents = 0;
+        for (size_t key = 0; key < F->slot_of.size(); ++key) {
+            if (F->slot_of[key] < 0) continue;
+            ++residents; hash = (hash ^ key) * 1099511628211ull;
+        }
+        std::fprintf(stderr, "EXPERT_CACHE gpu=%d mode=%d residents=%zu signature=%016llx pending=%zu/%zu plan=%09llx bg_up=%llu bg_down=%llu\n",
+                     m->dev_, mode, residents, (unsigned long long)hash, F->bg.size(), F->draining.size(),
+                     F->cpu_plan, (unsigned long long)F->bg_up, (unsigned long long)F->bg_down);
+        if (mode < 0 && (!F->bg.empty() || !F->draining.empty())) {
+            err = "expert cache freeze left pending moves"; return false;
+        }
+    }
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (!m->fast_) continue;
+        m->fast_->diagnostic_cache_mode = mode;
+        // Fixed expert selection for the worker-count control; adaptive finalist restores normal counts.
+        if (getenv("GLM_TEST_CPU_SWEEP")) m->fast_->md.dcnt = mode < 0 ? nullptr : m->fast_->dcnt_d;
+    }
+    cudaSetDevice(dev_);
+    return true;
+}
+
 bool Glm5Model::set_pcie_share(double share) {
     bool any = false;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -4465,6 +4512,24 @@ void Glm5Model::set_miss_skip(double w, int from) {
 void Glm5Model::set_read_chunks(int n) {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ != nullptr) m->fast_->read_chunks = n > 0 ? std::min(16, n) : 0;
+}
+
+void Glm5Model::fast_profile(bool enabled, const char* label, int outputs) {
+    win_pipe_drain();
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        FastState* F = m->fast_;
+        if (!F) continue;
+        cudaSetDevice(m->dev_);
+        if (F->prof_on && F->pn) F->collect();
+        if (label && outputs > 0) {
+            for (const auto& item : F->pacc)
+                std::fprintf(stderr, "PROFILE_STAGE phase=%s gpu=%d stage=%s total_ms=%.6f ms_output=%.6f\n",
+                             label, m->dev_, item.first.c_str(), item.second, item.second / outputs);
+        }
+        F->pacc.clear(); F->pn = 0; F->ptokens = 0; F->pseen = 0; F->pskip = 0;
+        F->prof_on = enabled;
+    }
+    cudaSetDevice(dev_);
 }
 
 Glm5Model::FastStats Glm5Model::fast_stats() const {
@@ -5386,7 +5451,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
     F->draining.swap(still);
     // (3)
     for (int il = l0_; il < lt_; ++il) {
-        if (F->bg_hold) break;   // lending retires moves without starting spare-refill demotions
+        if (F->bg_hold || F->diagnostic_cache_mode < 0) break;   // lending retires moves without starting spare-refill demotions
         auto& P = F->lp[(size_t) il];
         if (P.n == 0) continue;
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
@@ -5578,8 +5643,9 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }();
         // a pipelined window's boundary comes once for its tokens (not one a token): the budgets for them all
         const int bk = std::max(1, std::min(8, F->bnd_tokens.exchange(0)));
-        const int bg_nk = bg_n * bk;
-        const int bg_up_max = std::max(bg_n, bg_fill) * bk;
+        const int effective_bg_n = F->diagnostic_cache_mode > 0 ? std::max(8, bg_n) : bg_n;
+        const int bg_nk = effective_bg_n * bk;
+        const int bg_up_max = std::max(effective_bg_n, bg_fill) * bk;
         constexpr uint32_t bg_ratio = 2;
         bool lane_all = F->cpu_plan != 0ull;   // the CPU lane takes every RAM-tier expert of a route
         for (int f = 1; f <= g.n_exp_used && lane_all; ++f) lane_all = (int) ((F->cpu_plan >> (4 * f)) & 15ull) == f;
@@ -5596,7 +5662,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         // (the refill into FREE slots runs whatever the plan: a slot a prompt's lending gave back holds nothing - a
         // split whose cards send one of 7-8 RAM-tier experts over PCIe left ~13% of VRAM empty after a long prompt;
         // the swaps below stay with the all-CPU plan, beside which the routes' own promotions do not run)
-        if ((bg_n > 0 || bg_fill > 0) && !F->bg_hold && (int) F->bg.size() < 2 * bg_up_max) {
+        if (F->diagnostic_cache_mode >= 0 && (effective_bg_n > 0 || bg_fill > 0) && !F->bg_hold && (int) F->bg.size() < 2 * bg_up_max) {
             struct Cand {
                 uint32_t hot, cold;
                 int il, e, rs, free_slot, cold_slot;
@@ -5682,7 +5748,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }
     }
     flush();
-    if (ok && !fast_helper_adapt(err)) return false;
+    if (ok && F->diagnostic_cache_mode >= 0 && !fast_helper_adapt(err)) return false;
     F->check_resident(l0_, lt_, g.n_expert);   // (the tables as the next token's routes find them)
     static const bool diag = getenv("STRATA_GLM_TIER_DIAG") != nullptr;
     static const int diag_every = getenv("STRATA_GLM_TIER_DIAG_EVERY") ? std::max(1, std::atoi(getenv("STRATA_GLM_TIER_DIAG_EVERY"))) : 64;
@@ -5915,7 +5981,7 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
                   g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, F->cs,
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
-                  il == mtp_il_ ? mtp_skip_from() : glmfast::trunk_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min,
+                  il == mtp_il_ ? mtp_skip_from() : glmfast::trunk_skip_from(il), lane ? F->cpu_plan : 0ull, F->diagnostic_cache_mode < 0 ? 2147483647 : promote_min,
                   pf_rank, near_n, win, nullptr, win_n, il == mtp_il_ ? 8 : F->disk_skip_from,
                   il == mtp_il_ ? 0.0f : F->disk_skip_w, il == mtp_il_ ? 0.0f : [&] {
                       const float w = F->miss_w_req >= 0.0f ? F->miss_w_req : F->miss_w;
@@ -6169,10 +6235,6 @@ bool Glm5Model::fast_ml4_mixer(int il, int64_t p, std::string& err) {
     cudaStream_t s = F->cs;
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     const auto& Ly = F->L[(size_t) il];
-    if (kv_streamed(kv_, il) || kv_streamed(kv_, g.kv_of(il))) {
-        err = "glm fast: mistral-large4 with KV streaming is not ported yet";
-        return false;
-    }
     const bool full = g.indexer_full[(size_t) il] != 0, own = g.kv_of(il) == il, rope = g.has_rope(il);
     const int n_rot = rope ? g.n_rot : 0, qn = g.qk_nope_l(il);
     const int n_vis = (int) p + 1;
@@ -6195,6 +6257,7 @@ bool Glm5Model::fast_ml4_mixer(int il, int64_t p, std::string& err) {
                        gf::kTypeBF16, g.n_embd, g.idx_heads};
     }
     if (!gf::mv(j, nj, s)) { err = "glm fast: ml4 projections"; return false; }
+    if (F->prof_on) F->mark("ml4_proj");
     uint16_t* lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
     float* kpe = state_ + dsa_kpe_[(size_t) il];
     float* ik = state_ + dsa_pool_[(size_t) il];
@@ -6216,10 +6279,18 @@ bool Glm5Model::fast_ml4_mixer(int il, int64_t p, std::string& err) {
     d.eps = g.norm_eps;
     d.ln_eps = g.idx_ln_eps;
     d.rx = rx;
-    if (own && kvm_writer_ && il == kvm_src_) d.lat_host = kvm_host_;   // (the later parts' mirror of this layer)
+    if (own && kvm_writer_ && il == kvm_src_) d.lat_host = kvm_host_;
+    if (own && kv_streamed(kv_, il)) {
+        d.lat = nullptr;
+        d.lat_host = (uint16_t*) kv_->host[(size_t) il];
+        d.lat_slots = lat;
+        d.lat_table = kv_->map[(size_t) il].page_table;
+        d.lat_page = kv_->page;
+    }
     gf::dsa_rope_prep(d, s);
     gf::ssmax_heads(F->q, g.k_mla(), g.k_mla(), g.n_head, Ly.ssmax_w, Ly.ssmax_b, (int) p, s);
     if (rope) gf::rope_heads(F->q + qn, g.n_rot, g.k_mla(), g.n_head, (int) p, g.rope_base, s, 1, 0, rx);
+    if (F->prof_on) F->mark("ml4_prep_q");
     if (full) {
         F->dsa_n_sel = std::min(g.idx_top_k, n_vis);
         if (all) {
@@ -6238,12 +6309,20 @@ bool Glm5Model::fast_ml4_mixer(int il, int64_t p, std::string& err) {
         err = "glm fast: mistral-large4 layer " + std::to_string(il) + " shares an indexer selection this part never made";
         return false;
     }
-    gf::mla_pe(F->q, g.k_mla(), qn, n_rot, Ly.k_b, Ly.v_b, lat, kpe, F->cells, F->dsa_n_sel, g.n_head, g.kv_lora,
+    if (F->prof_on) F->mark("ml4_index");
+    if (!own && g.kv_of(il) < l0_ && kv_streamed(kv_, il))
+        gf::glm_kv_refresh(kv_->map[(size_t) il], kv_->host[(size_t) il], (uint8_t*) lat,
+                           kv_->row_bytes, kv_->page, p, 1, s);
+    const int* cells = kv_attend_cells(kv_, il, lat, F->cells, F->dsa_n_sel, F->slot_cells, s);
+    if (F->prof_on) F->mark("kv_resolve");
+    gf::mla_pe(F->q, g.k_mla(), qn, n_rot, Ly.k_b, Ly.v_b, lat, kpe, cells, F->dsa_n_sel, g.n_head, g.kv_lora,
                g.v_head, F->qabs, F->attn_q, s, dsa_rec_, dsa_rec_ / 2);
+    if (F->prof_on) F->mark("ml4_mla");
     if (dumps) fast_dump(s, "kqv_out-" + std::to_string(il), F->qabs + (size_t) g.n_head * g.kv_lora,
                          (int64_t) g.n_head * g.v_head);
     gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head, g.n_embd};
     if (!gf::mv(&o, 1, s)) { err = "glm fast: ml4 output"; return false; }
+    if (F->prof_on) F->mark("ml4_out");
     return true;
 }
 
@@ -6261,7 +6340,8 @@ bool Glm5Model::fast_layers_dsa(int64_t p, std::string& err) {
     cudaStream_t s = F->cs;
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     bool pf_pending = false;
-    if (kvm_host_ != nullptr && !kvm_writer_)   // mistral-large4: the KV source's record p from the earlier part
+    if (F->prof_on) F->mark("start");
+    if (kvm_host_ != nullptr && !kvm_writer_ && !kv_streamed(kv_, kvm_src_))   // mistral-large4: the KV source's record p from the earlier part
         cudaMemcpyAsync((uint16_t*) (state_ + dsa_lat_[(size_t) kvm_src_]) + (size_t) p * dsa_rec_,
                         kvm_host_ + (size_t) p * dsa_rec_, (size_t) dsa_rec_ * sizeof(uint16_t), cudaMemcpyHostToDevice,
                         s);
@@ -6274,12 +6354,14 @@ bool Glm5Model::fast_layers_dsa(int64_t p, std::string& err) {
         if (F->spec_gate) gf::skip_gate(F->spec_live_h, 0, F->spec_skip_d, s);
         gf::rms_q8(state_, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
         dflash_capture(il, state_, 1, p, F->cap, F->cap_rows, s);   // (the residual entering the layer: a drafter's feature)
+        if (F->prof_on) F->mark("attn_norm_capture");
         if (dumps) {
             if (il != l0_) fast_dump(s, "l_out-" + std::to_string(il - 1), state_, g.n_embd);
             fast_dump(s, "attn_norm-" + std::to_string(il), F->x, g.n_embd);
         }
         if (!fast_dsa_rope(il, p, err)) return false;
         gf::rms_q8(state_, F->mixer, Ly.ffn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        if (F->prof_on) F->mark("ffn_norm");
         if (dumps) fast_dump(s, "ffn_inp-" + std::to_string(il), state_, g.n_embd);
         if (!Ly.moe) {
             gf::MvJob j[2];
@@ -6293,11 +6375,13 @@ bool Glm5Model::fast_layers_dsa(int64_t p, std::string& err) {
         } else if (!fast_moe(il, pf_pending, err, true)) {
             return false;
         }
+        if (F->prof_on && !Ly.moe) F->mark("dense_ffn");
         if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
     }
     dsa_add_kernel<<<(g.n_embd + 255) / 256, 256, 0, s>>>(state_, F->ffn, g.n_embd);
     if (l1_ == g.n_layers) dflash_capture(g.n_layers, state_, 1, p, F->cap, F->cap_rows, s);   // (the final residual)
     if (dumps) fast_dump(s, "l_out-" + std::to_string(l1_ - 1), state_, g.n_embd);
+    if (F->prof_on) F->mark("residual_capture");
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         err = std::string("glm fast: ") + cudaGetErrorString(e);
@@ -6583,6 +6667,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
             std::fclose(f);
         }
     }
+    if (FT->prof_on) FT->mark("head_norm");
     const WSlot& ow = tail->ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, tail->sc_ + tail->sc_logits, nullptr, 1.0f, ow.type, g.n_embd,
                    g.n_vocab};
@@ -6594,6 +6679,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     if (g.softcap > 0.0f) gf::softcap(tail->sc_ + tail->sc_logits, g.n_vocab, g.softcap, FT->cs);
     gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
     cudaMemcpyAsync(FT->tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
+    if (FT->prof_on) FT->mark("head_sample");
     cudaEventRecord(FT->ev_done, FT->cs);
     // wait for the token (the service threads answer misses meanwhile)
     const auto tw = std::chrono::steady_clock::now();

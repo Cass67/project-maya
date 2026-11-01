@@ -10,6 +10,16 @@ namespace {
 
 constexpr int RT = kKvResolveBlock;
 
+__global__ void refresh_kernel(const int32_t* table, const uint8_t* host, uint8_t* slots, int row_bytes,
+                                int page, int64_t first) {
+    const int64_t p = first + blockIdx.x;
+    const int sl = table[p / page];
+    if (sl < 0) return;
+    const size_t dst = ((size_t) sl * page + p % page) * row_bytes;
+    for (int i = threadIdx.x; i < row_bytes / 16; i += blockDim.x)
+        ((uint4*) (slots + dst))[i] = ((const uint4*) (host + (size_t) p * row_bytes))[i];
+}
+
 // Block-wide exclusive prefix sum of one int per thread (RT threads); `total` is the sum over the block.
 __device__ int block_scan(int v, int* warp_sums, int& total) {
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -161,6 +171,12 @@ void glm_kv_resolve_rows(const KvResolveRows& a, int n, int row_bytes, int page,
     copy_rows_kernel<<<dim3(96, (unsigned) n), 128, 0, s>>>(a, page * row_bytes);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: resolve rows: %s\n", cudaGetErrorString(e));
+}
+
+void glm_kv_refresh(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,
+                    int64_t first, int count, cudaStream_t s) {
+    if (count <= 0) return;
+    refresh_kernel<<<count, 128, 0, s>>>(m.page_table, host, slots, row_bytes, page, first);
 }
 
 void glm_kv_resolve(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,

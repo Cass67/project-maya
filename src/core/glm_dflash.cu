@@ -1348,6 +1348,22 @@ static bool mv_cols(gf::MvJob j, int cols, size_t xq_s, size_t xf_s, size_t y_s,
     return true;
 }
 
+// Opt-in diagnostics keep draft failures at their source, before a target window
+// can report the drafter's sticky launch error. Disabled for normal serving.
+static bool dspark_check(cudaStream_t s, const char* stage, int initial_errors, std::string& err) {
+    static const bool trace = getenv("STRATA_GLM_DSPARK_TRACE") != nullptr;
+    if (!trace) return true;
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+    if (e != cudaSuccess || gf::launch_errors() != initial_errors) {
+        err = std::string("DSpark ") + stage + ": " +
+              (e != cudaSuccess ? cudaGetErrorString(e) : "kernel launch failed (see preceding diagnostic)");
+        return false;
+    }
+    std::fprintf(stderr, "DSpark trace: %s OK\n", stage);
+    return true;
+}
+
 // ---- mistral-large4's DSpark: load (the dflash.* keys of an MLA draft), inject, draft
 static bool dspark_mla_load(GlmDflash::Impl& m, const strata::GgufFile& G, const std::string& path, int dev,
                             std::string& err) {
@@ -1602,6 +1618,7 @@ static bool dspark_mla_inject(GlmDflash::Impl& m, int64_t lo, int64_t hi, cudaSt
     const uint32_t full = m.K >= 32 ? 0xffffffffu : (1u << m.K) - 1u;
     const int KE = m.K * m.E, kvw = a.kv_lora + a.n_rot;
     cudaSetDevice(m.dev);
+    const int initial_errors = gf::launch_errors();
     std::vector<std::pair<int64_t, int64_t>> runs;
     {
         std::lock_guard<std::mutex> lk(m.mu);
@@ -1627,14 +1644,18 @@ static bool dspark_mla_inject(GlmDflash::Impl& m, int64_t lo, int64_t hi, cudaSt
             i += len;
         }
         kv_pos_kernel<<<(n + 127) / 128, 128, 0, s>>>(p0, n, m.ring, m.kv_pos);
+        if (!dspark_check(s, "inject positions", initial_errors, err)) return false;
         gf::quantize_q8_1(m.feat, m.fq, n * KE, s);
+        if (!dspark_check(s, "quantize m.feat", initial_errors, err)) return false;
         if (!mv_cols({m.fc.w, m.fq, xf_for(m.fc.type, m.feat), m.g, nullptr, 1.0f, m.fc.type, KE, m.E}, n, m.q8(KE),
                      KE, m.E, s)) {
             err = "glm dflash: fc";
             return false;
         }
         rms_rows_kernel<<<n, 256, 0, s>>>(m.g, m.E, m.enc_norm, m.eps, m.E, m.gn, m.E);
+        if (!dspark_check(s, "inject norm", initial_errors, err)) return false;
         gf::quantize_q8_1(m.gn, m.gq, n * m.E, s);
+        if (!dspark_check(s, "quantize m.gn", initial_errors, err)) return false;
         for (int il = 0; il < m.n_layer; ++il) {
             const auto& Ly = a.L[(size_t) il];
             if (!mv_cols({Ly.kv_a.w, m.gq, xf_for(Ly.kv_a.type, m.gn), a.kvraw, nullptr, 1.0f, Ly.kv_a.type, m.E, kvw}, n,
@@ -1660,6 +1681,7 @@ static bool dspark_mla_draft(GlmDflash::Impl& m, int32_t anchor, int64_t n_past,
     if (n_max < 1) return true;
     const int B = n_max, E = m.E, qd = m.n_head * a.k_mla, kvw = a.kv_lora + a.n_rot;
     cudaSetDevice(m.dev);
+    const int initial_errors = gf::launch_errors();
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) emb_type);
     if (tt == nullptr || tt->to_float == nullptr || emb == nullptr) {
         err = "glm dflash: no embedding dequantizer";
@@ -1692,7 +1714,9 @@ static bool dspark_mla_draft(GlmDflash::Impl& m, int32_t anchor, int64_t n_past,
     for (int il = 0; il < m.n_layer; ++il) {
         const auto& Ly = a.L[(size_t) il];
         rms_rows_kernel<<<B, 256, 0, s>>>(m.h, E, Ly.attn_norm, m.eps, E, m.x, E);
+        if (!dspark_check(s, "attention norm", initial_errors, err)) return false;
         gf::quantize_q8_1(m.x, m.xq, B * E, s);
+        if (!dspark_check(s, "quantize m.x", initial_errors, err)) return false;
         gf::MvJob jq[2] = {job(Ly.q, m.x, a.q, B), job(Ly.kv_a, m.x, a.kvraw, 1)};
         if (!gf::mv(jq, 2, s)) { err = "glm dflash: q / kv_a"; return false; }
         // the anchor row's key at n_past (every row sees it), the rows' q_pe and q_abs
@@ -1704,23 +1728,31 @@ static bool dspark_mla_draft(GlmDflash::Impl& m, int32_t anchor, int64_t n_past,
             a.qabs, a.q, a.ring_lat + (size_t) il * m.ring * a.kv_lora, a.ring_kpe + (size_t) il * m.ring * a.n_rot,
             m.kv_pos, m.ring, lo, n_past, a.anc, a.anc + a.kv_lora, m.n_head, a.k_mla, a.nope, a.n_rot, a.kv_lora,
             a.v_mla, Ly.v_b, scale, a.att);
+            if (!dspark_check(s, "MLA attention", initial_errors, err)) return false;
         gf::quantize_q8_1(a.att, m.xq, B * m.n_head * a.v_mla, s);
+        if (!dspark_check(s, "quantize a.att", initial_errors, err)) return false;
         gf::MvJob jo = job(Ly.o, a.att, m.o, B);
         if (!gf::mv(&jo, 1, s)) { err = "glm dflash: attn output"; return false; }
         add_kernel<<<(B * E + 255) / 256, 256, 0, s>>>(m.h, m.o, B * E);
         rms_rows_kernel<<<B, 256, 0, s>>>(m.h, E, Ly.ffn_norm, m.eps, E, m.x, E);
+        if (!dspark_check(s, "FFN norm", initial_errors, err)) return false;
         gf::quantize_q8_1(m.x, m.xq, B * E, s);
+        if (!dspark_check(s, "quantize m.x", initial_errors, err)) return false;
         gf::MvJob j2[2] = {job(Ly.gate, m.x, m.gt, B), job(Ly.up, m.x, m.up, B)};
         if (!gf::mv(j2, 2, s)) { err = "glm dflash: ffn gate / up"; return false; }
         silu_mul_kernel<<<(B * m.n_ff + 255) / 256, 256, 0, s>>>(m.gt, m.up, B * m.n_ff, m.act);
+        if (!dspark_check(s, "FFN activation", initial_errors, err)) return false;
         gf::quantize_q8_1(m.act, m.xq, B * m.n_ff, s);
+        if (!dspark_check(s, "quantize m.act", initial_errors, err)) return false;
         gf::MvJob jd = job(Ly.down, m.act, m.o, B);
         if (!gf::mv(&jd, 1, s)) { err = "glm dflash: ffn down"; return false; }
         add_kernel<<<(B * E + 255) / 256, 256, 0, s>>>(m.h, m.o, B * E);
     }
     // the rows' final norm, the target's head (softcapped), then the Markov chain
     rms_rows_kernel<<<B, 256, 0, s>>>(m.h, E, m.out_norm, m.eps, E, m.xc, E);
+    if (!dspark_check(s, "output norm", initial_errors, err)) return false;
     gf::quantize_q8_1(m.xc, m.xq, B * E, s);
+    if (!dspark_check(s, "quantize m.xc", initial_errors, err)) return false;
     gf::MvJob jh{head.q, m.xq, m.xc, m.logits, nullptr, 1.0f, head.type, E, m.V};
     if (head.type == 0) jh.w = head.f32;
     jh.ncol = B;
@@ -1736,11 +1768,15 @@ static bool dspark_mla_draft(GlmDflash::Impl& m, int32_t anchor, int64_t n_past,
     const int J = E + 2 * a.R;
     for (int t = 0; t < B; ++t) {
         markov_in_kernel<<<(J + 255) / 256, 256, 0, s>>>(a.state, a.w1, a.prev, m.xc + (size_t) t * E, a.R, E, a.jvec);
+        if (!dspark_check(s, "Markov input", initial_errors, err)) return false;
         gf::quantize_q8_1(a.jvec, a.jq, J, s);
+        if (!dspark_check(s, "quantize a.jvec", initial_errors, err)) return false;
         gf::MvJob jj{a.joint.w, a.jq, xf_for(a.joint.type, a.jvec), a.jout, nullptr, 1.0f, a.joint.type, J, 3 * a.R};
         if (!gf::mv(&jj, 1, s)) { err = "glm dflash: joint_proj"; return false; }
         markov_gate_kernel<<<(a.R + 255) / 256, 256, 0, s>>>(a.jout, a.joint_b, a.R, a.state, a.mk);
+        if (!dspark_check(s, "Markov gate", initial_errors, err)) return false;
         gf::quantize_q8_1(a.mk, a.mq, a.R, s);
+        if (!dspark_check(s, "quantize a.mk", initial_errors, err)) return false;
         gf::MvJob jw{a.w2.w, a.mq, xf_for(a.w2.type, a.mk), a.bias, nullptr, 1.0f, a.w2.type, a.R, m.V};
         if (!gf::mv(&jw, 1, s)) { err = "glm dflash: markov_w2"; return false; }
         float* row = m.logits + (size_t) t * m.V;
@@ -2389,6 +2425,59 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         tnow = t;
     };
     // the first token: the prompt's last forward left its logits on the tail
+    const char* diff_prefix = getenv("STRATA_GLM_DFLASH_DIFF_PREFIX");
+    bool diff_saved = false;
+    std::vector<int> diagnostic_reference;
+    if (const char* ids_path = getenv("STRATA_GLM_DFLASH_DIFF_IDS"); ids_path && ids_path[0]) {
+        FILE* ids_file = std::fopen(ids_path, "r");
+        if (!ids_file) { err = "dflash diagnostic: cannot open reference IDs"; return false; }
+        int id = 0;
+        while (std::fscanf(ids_file, "%d", &id) == 1) {
+            if (id < 0 || id >= g_.n_vocab || diagnostic_reference.size() >= 1000000) {
+                std::fclose(ids_file); err = "dflash diagnostic: invalid reference IDs"; return false;
+            }
+            diagnostic_reference.push_back(id);
+        }
+        const bool valid = std::feof(ids_file) != 0;
+        std::fclose(ids_file);
+        if (!valid) { err = "dflash diagnostic: malformed reference IDs"; return false; }
+    }
+    // Opt-in diagnostic: the first differing target row only. No extra device
+    // synchronization before a disagreement, so the first failure stays observable.
+    const auto save_diff = [&](int row, int actual) -> bool {
+        const size_t output_index = (size_t) produced + (size_t) std::max(0, row);
+        const int followed = follow_peek((size_t) std::max(0, row));
+        const int expected = followed >= 0 ? followed : output_index < diagnostic_reference.size()
+                                                        ? diagnostic_reference[output_index] : -1;
+        if (diff_saved || diff_prefix == nullptr || !diff_prefix[0] || expected < 0 || actual == expected) return true;
+        std::vector<float> values;
+        if (row >= 0 && fast_->win.T > 0) {
+            if (!window_logits(values, err)) return false;
+            const size_t offset = (size_t) row * g_.n_vocab;
+            values = std::vector<float>(values.begin() + offset, values.begin() + offset + g_.n_vocab);
+        } else {
+            values.resize((size_t) g_.n_vocab);
+            cudaSetDevice(tail->dev_);
+            const auto status = cudaMemcpy(values.data(), tail->sc_ + tail->sc_logits,
+                                            values.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaSetDevice(dev_);
+            if (status != cudaSuccess) { err = "dflash diagnostic: head copy failed"; return false; }
+        }
+        const std::string base(diff_prefix);
+        FILE* f = std::fopen((base + ".window.bin").c_str(), "wb");
+        if (!f) { err = "dflash diagnostic: cannot open row"; return false; }
+        const bool written = std::fwrite(values.data(), sizeof(float), values.size(), f) == values.size();
+        const bool closed = std::fclose(f) == 0;
+        f = std::fopen((base + ".index.txt").c_str(), "w");
+        if (!f) { err = "dflash diagnostic: cannot open index"; return false; }
+        std::fprintf(f, "%zu %d %d\n", output_index, expected, actual);
+        const bool meta_closed = std::fclose(f) == 0;
+        if (!written || !closed || !meta_closed) { err = "dflash diagnostic: write failed"; return false; }
+        std::fprintf(stderr, "dflash diagnostic: first target difference at output %zu: %d vs serial %d\n",
+                     output_index, actual, expected);
+        diff_saved = true;
+        return true;
+    };
     int y = -1;
     if (sp.greedy && sp.penalty_last_n <= 0 && last_tok_ >= 0) {   // (penalties: picked through the sampler)
         y = last_tok_;
@@ -2396,6 +2485,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         y = sample_token(sp, err);
         if (y < 0) return false;
     }
+    if (!save_diff(-1, y)) return false;
     y = forced(y);
     sp.counter += 1;
     ++produced;
@@ -2529,7 +2619,9 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
             // are captured for the drafter there), the next token picked as the token loop picks it
             std::vector<float> lg;
             if (!forward({y}, lg, err)) return false;
-            const int y2 = forced(sample_token(sp, err));
+            const int picked = sample_token(sp, err);
+            if (!save_diff(-1, picked)) return false;
+            const int y2 = forced(picked);
             if (y2 < 0) return false;
             if (stats != nullptr) {
                 const auto t_tok = std::chrono::steady_clock::now();
@@ -2604,6 +2696,8 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         // reasoning closed by the caller - ends the run there, like a wrong draft)
         int acc = 0;
         while (acc < T - 1 && tok[(size_t) acc + 1] == goes_out(acc)) ++acc;
+        for (int t = 0; t <= acc && produced + t < max_new; ++t)
+            if (!save_diff(t, out[(size_t) t])) return false;
         if (stats != nullptr) {
             const auto t_win = std::chrono::steady_clock::now();
             const auto lm = lane_of();
