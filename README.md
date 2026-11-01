@@ -61,6 +61,18 @@ git clone -b ml4-port https://github.com/Cass67/project-maya.git && cd project-m
 ./setup.sh
 ```
 
+### NVIDIA or AMD
+
+Both branches build on either backend; what differs is how a prompt is read.
+
+- **AMD (HIP)** runs the fast batched prompt path these ports add.
+- **NVIDIA (CUDA)** builds and runs too, but that path multiplies its experts with MMQ, which is HIP-only. Setup
+  prints `this build has no MMQ kernels - the prompt runs token by token` and reads prompts a token at a time.
+  Decode speed is unaffected and no setting is needed.
+
+Moving the batched path to CUDA is one kernel - `mla_attn_wmma2_kernel` in `src/kernels/cuda/glm_batch.cu`, HIP wmma
+to `nvcuda::wmma` - and nothing else. Until then, CUDA builds read prompts on the token path.
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>Pick your model
 
 Every Maya quant is named after its model, then its tier - XS, S, M or L, by how many bits its experts keep. The setup
