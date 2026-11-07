@@ -3906,7 +3906,7 @@ void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
     pdl_launch(hc_mix_scale_kernel, T, kThreads, 0, s, h, hcdim, n_mix, eps, mixes);
 }
 void hc_split_pre_norm(const HcFuse& a, cudaStream_t s, int T) {
-    hc_split_pre_norm_kernel<<<dim3(2, (unsigned) std::max(1, T)), 1024, 0, s>>>(a);
+    plain_launch(hc_split_pre_norm_kernel, dim3(2, (unsigned) std::max(1, T)), 1024, 0, s, a);
 }
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, int fmt) {
     if (T > 0) pdl_launch(engram_dequant_tok_kernel, T * cols, kThreads, 0, s, src, per, cols, hd, out, fmt);
@@ -4053,7 +4053,7 @@ void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStre
 }
 bool swiglu_q8(const float* g, const float* u, int n, float lim, float* h, int8_t* q, float* qd, cudaStream_t s) {
     if (n % 32 != 0 || q == nullptr || qd == nullptr) return false;
-    if (n > 0) swiglu_q8_kernel<<<cdiv(n, kThreads), kThreads, 0, s>>>(g, u, n, lim, h, q, qd);
+    if (n > 0) plain_launch(swiglu_q8_kernel, cdiv(n, kThreads), kThreads, 0, s, g, u, n, lim, h, q, qd);
     return true;
 }
 bool copy_regions(const CopyRegions& r, cudaStream_t s) {

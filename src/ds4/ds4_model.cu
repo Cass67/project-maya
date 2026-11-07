@@ -33,6 +33,7 @@
 #include "ds4_os.hpp"
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
+#include "ds4_pdl.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
 #include "ds4_path_policy.hpp"
@@ -655,6 +656,15 @@ struct Dev {
     int grp = 0, mi = 0;
     unsigned ar_seq = 0;
     unsigned* xcnt = nullptr;
+    // DS4_SEG_GRAPH: this device's captured segment graphs, [layer][segment] by the hash of their launches (only its
+    // own thread touches them), and the hits since the last report
+    struct SegSite {
+        std::unordered_map<uint64_t, cudaGraphExec_t> g;
+        long hit = 0, miss = 0;
+        bool off = false;
+    };
+    std::vector<SegSite> seg;
+    unsigned long seg_hits = 0;
     // the head group's members (the last layer's group): each its columns (split128 of V) of the head and the norms;
     // logits_part: a member's share of the logits (the lead's: where the others' land before they join its rows)
     x3::Mat head;
@@ -2498,6 +2508,97 @@ struct Model::Impl {
     void ablate(const Dev& d, float* y, int T, cudaStream_t s) const {
         if (d.abl_r != nullptr) project_out(y, d.abl_r, abl_scale, g.dim, T, s);
     }
+    // DS4_SEG_GRAPH=1 (HIP): a decode layer's runs of launches whose arguments stay the same from token to token
+    // (the attention's input projections, its output projections, the FFN's hyper-connection mix, the shared expert)
+    // recorded (ds4_pdl.cuh), then replayed as the graph captured for the same launches.  A site that keeps changing
+    // stops at kSegVariants graphs and launches directly from then on.  DS4_SEG_GRAPH_LOG=1: hits, misses and the
+    // sites that stopped, every 16384 hits a device.
+    static constexpr int kSegs = 4, kSegVariants = 32;
+    const bool seg_graph = [] {
+#if defined(STRATA_USE_HIP)
+        const char* v = std::getenv("DS4_SEG_GRAPH");
+        return v != nullptr && std::atoi(v) != 0;
+#else
+        return false;
+#endif
+    }();
+    const bool seg_log = std::getenv("DS4_SEG_GRAPH_LOG") != nullptr;
+    struct SegScope {   // a segment's recording; an early return drops it
+        SegRec r;
+        bool on = false;
+        SegScope() = default;
+        SegScope(const SegScope&) = delete;
+        SegScope& operator=(const SegScope&) = delete;
+        ~SegScope() {
+            if (g_seg == &r) g_seg = nullptr;
+        }
+    };
+    void seg_begin(SegScope& sc, cudaStream_t s, bool want) {
+        sc.on = want;
+        if (!want) return;
+        sc.r = SegRec();
+        sc.r.s = s;
+        g_seg = &sc.r;
+    }
+    void seg_report(const Dev& d) {
+        long hit = 0, miss = 0, var = 0, off = 0;
+        for (const Dev::SegSite& x : d.seg) {
+            hit += x.hit;
+            miss += x.miss;
+            var += (long) x.g.size();
+            off += x.off ? 1 : 0;
+        }
+        std::fprintf(stderr, "ds4: DS4_SEG_GRAPH: CUDA%d %ld hits, %ld misses, %ld graphs, %ld sites direct\n", d.id,
+                     hit, miss, var, off);
+    }
+    bool seg_end(Dev& d, SegScope& sc, int il, int id, std::string& err) {
+        if (!sc.on || g_seg != &sc.r) return true;
+        g_seg = nullptr;
+        sc.on = false;
+        SegRec& r = sc.r;
+        if (r.ops.empty()) return true;
+        const size_t at = (size_t) il * kSegs + (size_t) id;   // (the MTP layers' il can be past g.nl)
+        if (at >= d.seg.size()) d.seg.resize(at + kSegs);
+        Dev::SegSite& site = d.seg[at];
+        const auto it = site.g.find(r.h);
+        if (it != site.g.end()) {
+            ++site.hit;
+            if (seg_log && (++d.seg_hits & 0x3fff) == 0) seg_report(d);
+            if (cudaGraphLaunch(it->second, r.s) != cudaSuccess) {
+                err = "DS4_SEG_GRAPH: a graph launch failed";
+                return false;
+            }
+            return true;
+        }
+        ++site.miss;
+        cudaGraphExec_t ex = nullptr;
+        if (!site.off && site.g.size() < (size_t) kSegVariants &&
+            cudaStreamBeginCapture(r.s, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+            for (auto& f : r.ops) f();
+            cudaGraph_t gr = nullptr;
+            const bool cap = cudaStreamEndCapture(r.s, &gr) == cudaSuccess && gr != nullptr;
+            if (cap && cudaGraphInstantiate(&ex, gr, 0) != cudaSuccess) ex = nullptr;
+            if (gr != nullptr) cudaGraphDestroy(gr);
+        }
+        if (ex == nullptr) {   // (at the limit, or the capture failed: the launches as recorded, from now on always)
+            (void) cudaGetLastError();
+            if (!site.off) {
+                site.off = true;
+                if (seg_log)
+                    std::fprintf(stderr, "ds4: DS4_SEG_GRAPH: CUDA%d layer %d segment %d: %s at %zu graphs, launched directly now\n",
+                                 d.id, il, id, site.g.size() >= (size_t) kSegVariants ? "limit" : "capture failed",
+                                 site.g.size());
+            }
+            for (auto& f : r.ops) f();
+            return true;
+        }
+        site.g.emplace(r.h, ex);
+        if (cudaGraphLaunch(ex, r.s) != cudaSuccess) {
+            err = "DS4_SEG_GRAPH: a graph launch failed";
+            return false;
+        }
+        return true;
+    }
     static const Layer& member(const Layer& l, int m) { return m == 0 ? l : l.mates[(size_t) m - 1]; }
     // bytes of a VRAM slot of l's experts (a member's part of each, in a group)
     static size_t unit(const Layer& l) { return l.nm > 1 ? l.hblob : l.blob; }
@@ -2603,8 +2704,10 @@ struct Model::Impl {
         bool reach = true;
 #if defined(STRATA_USE_HIP)
         // (#809: with the BAR read right, AMD cards engage the peer buffers and the first request hangs in ar2_kernel on
-        // a 2x RX 7900 XTX pair; until that is understood they stay host-mapped, as they did while the BAR read as 0)
-        reach = false;
+        // a 2x RX 7900 XTX pair; until that is understood they stay host-mapped, as they did while the BAR read as 0.
+        // DS4_AR_P2P_AMD=1 engages them anyway, to test groups of three or four, whose all-reduce is ar_rs16_kernel)
+        static const bool amd_ok = std::getenv("DS4_AR_P2P_AMD") != nullptr && std::atoi(std::getenv("DS4_AR_P2P_AMD")) != 0;
+        if (!amd_ok) reach = false;
 #endif
         for (int m : G.mem) {
             int can = 0;
@@ -21554,6 +21657,11 @@ struct Model::Impl {
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }
+        // (DS4_SEG_GRAPH: the runs below whose launches stay the same token to token, as graphs - not beside st2, a
+        //  multi step, the routing on the host, profiling, dumps or abliteration, which put other work between them)
+        const bool sg = seg_graph && !hs && wp.nrow == 0 && wp.async && T <= kWin && !prof_window && !prof_chunk &&
+                        dump_l == nullptr && acc_dump == nullptr && d.abl_r == nullptr;
+        SegScope sc;
         // attention
         // (hc_side: hc_mix + hc_split on st2 beside the attention - the pre norm takes the lagged pre, a_post / a_comb /
         // a_pre are read from the attention's hc_post on, where st waits for them)
@@ -21561,6 +21669,7 @@ struct Model::Impl {
             CK(cudaEventRecord(d.hc_go, s));
             CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
         }
+        seg_begin(sc, s, sg);   // (segment 0: the mix and split, the norm, q / kv in, q's norm, wq_b)
         if (ms)
             hc_mix_split(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcc, l.hca_scale, l.hca_base, H,
                          g.sinkhorn, g.hc_eps, d.a_pre, d.a_post, d.a_comb, hcs);
@@ -21604,6 +21713,7 @@ struct Model::Impl {
         if (NHL > 0) {
             x3::MvJob jb = job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ);
             if (!mv_n(d, &jb, 1, err, qr8 ? &qrp : nullptr)) return false;
+            if (!seg_end(d, sc, l.il, 0, err)) return false;
             Finish fr;
             fr.rd = g.rd;
             fr.pos = (int) p0;
@@ -21623,6 +21733,7 @@ struct Model::Impl {
                     finish(d.q + (size_t) t * HQ, NHL, HD, HD, fr, s);
                 }
         }
+        if (!seg_end(d, sc, l.il, 0, err)) return false;   // (no heads: segment 0 ends at q's norm)
         if (wp.nrow == 0) {
             if (!attn_core(l, mi, d, p0, T, 0, wp, attn_bound(l), err)) return false;
         } else if (ma) {   // (DS4_MULTI_ATTN: the rows' attention in one launch a step)
@@ -21639,15 +21750,18 @@ struct Model::Impl {
             if (!multi_put(l, mi, d, wp, err)) return false;
         }
         if (NHL > 0) {
+            seg_begin(sc, s, sg);   // (segment 1: wo_a, wo_b)
             x3::MvJob j[16];
             const int per = HQ / OG;
             for (int gi = 0; gi < OG; ++gi)
                 j[gi] = job(l.wo_a[gi], d.o + (size_t) gi * per, d.oa + (size_t) gi * g.o_lora, T, HQ, (size_t) OG * g.o_lora);
             if (!mv_n(d, j, OG, err)) return false;
             if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
+            if (!seg_end(d, sc, l.il, 1, err)) return false;
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
+        seg_begin(sc, s, sg);   // (segment 2: the attention's hc_post, the FFN's mix and split and norm)
         ablate(d, d.ao, T, s);
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
@@ -21675,6 +21789,7 @@ struct Model::Impl {
             if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
             hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         }
+        if (!seg_end(d, sc, l.il, 2, err)) return false;
         const gg::PreQ8* ffn_q8 = fuse && hc_fuse_win ? &xq8 : nullptr;   // (the shared expert's w1 / w3 input)
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
@@ -21740,11 +21855,13 @@ struct Model::Impl {
                               na[0], na[1], lead && self_answer ? resps + slot : nullptr, d.cpu_any,
                               lane_done);
             }
+            seg_begin(sc, s, sg);   // (segment 3: the shared expert)
             {
                 x3::MvJob js[2] = {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)};
                 if (!mv_n(d, js, 2, err, ffn_q8)) return false;
             }
             if (!shared_down(d, l, T, FF, err)) return false;
+            if (!seg_end(d, sc, l.il, 3, err)) return false;
             prof_mark(d, 2);
             const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
             // (a tensor-parallel group: every member sums its own FF band, so every member adds its own part of the

@@ -257,7 +257,7 @@ void q8_quant_jobs(const Q8Jobs& J, int n, cudaStream_t s) {
 // launch at each job; share: a job whose input an earlier one's is (the same x, stride, rows and k - wq_a, wkv and the
 // compressor's two on one x, the shared expert's w1 and w3) reads that job's rows instead of rounding them again
 struct Q8Round {
-    Q8Jobs J;
+    Q8Jobs J{};   // (zeroed: DS4_SEG_GRAPH hashes the unused slots too)
     int n = 0;   // (<= kMaxMvJobs: a job adds one at most)
     bool batch = true, share = true;
     // (rq, rd): where the job reads its rows - (q, d), or the earlier job's
@@ -1755,7 +1755,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
     BfJobs J[3] = {};   // the BF16 jobs, the MXFP4 ones, the Q8_0 ones: a launch each
     int nj[3] = {0, 0, 0}, max_n[3] = {0, 0, 0}, max_c[3] = {1, 1, 1};
     bool vec[3] = {true, true, true};
-    iq::MvJob IJ[x3::kMaxMvJobs];   // the low-bit ones (ds4_iq: a launch a type)
+    iq::MvJob IJ[x3::kMaxMvJobs] = {};   // the low-bit ones (ds4_iq: a launch a type)
     int nij = 0;
     Q8Round QR;   // (the jobs' int8 inputs: one launch before the GEMVs, an input read by several jobs rounded once)
     QR.batch = q8_batch();
