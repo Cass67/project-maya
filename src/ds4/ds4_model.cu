@@ -1519,6 +1519,44 @@ struct Model::Impl {
     std::vector<uint8_t> eg_q6k;   // Engram layer li's row format: 1 ggml Q6_K (superblocks of 256), 2 IQ4_NL (blocks of
                                    // 32), 0 FP8
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
+    // DS4_LANE_TRACE=<file>: one record a serve_lane answer (times in ns; ph: the end of each run_nodes batch)
+    struct LaneRec {
+        int64_t seen, cpu0, cpu1, done, bytes;
+        int64_t ph[6];
+        int64_t pfwait;
+        int32_t li, T, nslots, nents, nph, ng;
+        int32_t hit[4];   // of the entries, how many the previous layer's CPU-lane guesses held in their first 1 2 4 8
+        int32_t pfn, pfhit;   // experts read ahead for this layer, and how many of them it computed
+    };
+    FILE* lane_tr = nullptr;
+    int lane_nph = 0;
+    int64_t lane_ph[6] = {};
+    // DS4_AHEAD_RAM=1: the device guesses the next layer's picks for layers whose CPU-lane experts are all in RAM too.
+    // DS4_LANE_PF=<n>: once a layer is answered, the lane's workers read the next layer's first n CPU-lane guesses (each
+    // node its own part, from its RAM copy) into the caches, stopped when the next request comes
+    const bool ahead_ram = std::getenv("STRATA_DS4_AHEAD_RAM") != nullptr || std::getenv("DS4_AHEAD_RAM") != nullptr;
+    const int lane_pf = [] {
+        const char* v = std::getenv("STRATA_DS4_LANE_PF");
+        if (v == nullptr) v = std::getenv("DS4_LANE_PF");
+        return v != nullptr ? std::max(0, std::min(16, std::atoi(v))) : 0;
+    }();
+    std::vector<std::array<int16_t, 16>> pf_gl;   // layer -> the CPU-lane guesses for it, best first
+    std::vector<int8_t> pf_gn;
+    std::vector<std::array<int16_t, 16>> pf_set;   // layer -> the experts read ahead for it
+    std::vector<int8_t> pf_sn;
+    std::mutex pool_mu;
+    bool pf_on = false;   // (pool_mu) a read-ahead batch is in the pools
+    std::atomic<bool> pf_abort{false};
+    std::vector<std::pair<const uint8_t*, uint32_t>> pf_chunks[4];
+    std::function<void(int)> pf_fn[4];
+    std::atomic<uint64_t> pf_sink{0};
+    void pf_stop_locked() {
+        if (!pf_on) return;
+        pf_abort.store(true, std::memory_order_release);
+        for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
+        pf_abort.store(false, std::memory_order_relaxed);
+        pf_on = false;
+    }
     std::atomic<int64_t> eg_pf_rows_n{0}, eg_pf_hits_n{0}, eg_pf_reads_n{0}, eg_pf_wait_ns{0}, eg_pf_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
@@ -10829,6 +10867,8 @@ struct Model::Impl {
     // row's expert output.
     using Ent = LaneEnt;
     void run_nodes(int n, const std::function<void(int)>* f, int ph = -1) {
+        std::lock_guard<std::mutex> lk(pool_mu);
+        pf_stop_locked();
         static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
         if (stats && ph >= 0) {   // (each job's own time, summed: the phase's work beside its wall time)
             std::function<void(int)> g[4];
@@ -10849,6 +10889,7 @@ struct Model::Impl {
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, f[X]);
         pools[0]->help();
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
+        if (lane_tr != nullptr && lane_nph < 6) lane_ph[lane_nph++] = now_ns();
     }
 
     // a GGUF's MXFP4 experts on the CPU lane, read from the file's mapping or their copy in RAM (mx_part_ptr): each
@@ -12543,7 +12584,7 @@ struct Model::Impl {
             (int) n.slot.size() < n.n_exp)
             return nullptr;
         for (int e = 0; e < n.n_exp; ++e)
-            if (file_read(n, e)) return &n;
+            if (file_read(n, e) || (ahead_ram && n.slot[(size_t) e] < 0)) return &n;
         return nullptr;
     }
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
@@ -15180,9 +15221,69 @@ struct Model::Impl {
             std::fwrite(v.data(), 4, v.size(), rtrace);
         }
     }
+    // (serve_lane, a layer answered) request r's guesses for layer j that the CPU lane would compute, best first, kept for
+    // its hit counts; DS4_LANE_PF: the first lane_pf of them in RAM read into the caches by the lane's workers, now
+    void lane_guess(int j, const Req& r, int T) {
+        const int m = std::min(r.na[0], kAhead1);
+        if (m <= 0) return;
+        const Layer& n = L[(size_t) j];
+        if ((int) n.slot.size() < n.n_exp) return;
+        auto& gl = pf_gl[(size_t) j];
+        int gn = 0;
+        for (int i = 0; i < m && gn < 16; ++i)
+            for (int t = 0; t < T && gn < 16; ++t) {
+                const int e = r.ahead[t][i];
+                if (e < 0 || e >= n.n_exp || n.slot[(size_t) e] >= 0 || helper_owned(n, e)) continue;
+                bool dup = false;
+                for (int q = 0; q < gn; ++q) dup = dup || gl[(size_t) q] == e;
+                if (!dup) gl[(size_t) gn++] = (int16_t) e;
+            }
+        pf_gn[(size_t) j] = (int8_t) gn;
+        if (lane_pf <= 0 || !copy_mode || n.ram.empty() || n.lay.fmt != gg::kFmtMXFP4) return;
+        std::unique_lock<std::mutex> lk(pool_mu, std::try_to_lock);
+        if (!lk.owns_lock() || pf_on) return;
+        auto& ps = pf_set[(size_t) j];
+        int sn = 0;
+        for (int q = 0; q < gn && sn < lane_pf; ++q)
+            if (n.ram[(size_t) gl[(size_t) q]] >= 0) ps[(size_t) sn++] = gl[(size_t) q];
+        pf_sn[(size_t) j] = (int8_t) sn;
+        if (sn == 0) return;
+        constexpr size_t kChunk = 64 << 10;
+        for (int X = 0; X < NH; ++X) {
+            auto& ch = pf_chunks[X];
+            ch.clear();
+            for (int q = 0; q < sn; ++q)
+                for (int rr = 0; rr < 3; ++rr) {
+                    const uint8_t* p = mx_part_ptr(n, ps[(size_t) q], rr, X);
+                    const size_t nb = (size_t) (mx_n(rr) / NH) * mx_row_b(n, rr);
+                    for (size_t o = 0; o < nb; o += kChunk) ch.push_back({p + o, (uint32_t) std::min(kChunk, nb - o)});
+                }
+            pf_fn[X] = [this, X](int i) {
+                if (pf_abort.load(std::memory_order_relaxed)) return;
+                const auto& c = pf_chunks[X][(size_t) i];
+                uint64_t s = 0;
+                for (uint32_t o = 0; o < c.second; o += 64) s += *(volatile const uint64_t*) (c.first + o);
+                pf_sink.fetch_add(s, std::memory_order_relaxed);
+            };
+        }
+        for (int X = 0; X < NH; ++X) pools[(size_t) X]->start((int) pf_chunks[X].size(), pf_fn[X]);
+        pf_on = true;
+    }
     void serve_lane() {
         unsigned next = 1;
         rtrace_open();
+        if (const char* f = ds4_env("DS4_LANE_TRACE")) {
+            lane_tr = std::fopen(f, "wb");
+            if (lane_tr != nullptr) std::setvbuf(lane_tr, nullptr, _IOFBF, 1 << 20);
+            else std::fprintf(stderr, "ds4: DS4_LANE_TRACE: cannot open %s\n", f);
+        }
+        pf_gl.assign(L.size(), {});
+        pf_gn.assign(L.size(), 0);
+        pf_set.assign(L.size(), {});
+        pf_sn.assign(L.size(), 0);
+        if (lane_pf > 0 || ahead_ram)
+            std::fprintf(stderr, "ds4: CPU lane: next-layer guesses for RAM layers %s, read ahead %d (DS4_LANE_PF)\n",
+                         ahead_ram ? "on" : "off", lane_pf);
         auto last = std::chrono::steady_clock::now();
         // Idle (through a prompt, between requests) the thread backs off in stages instead of waking every 20 us for
         // good - a core of a server busy enough to show in `top` while nothing ran (issue #685).  A decode's routes
@@ -15234,6 +15335,16 @@ struct Model::Impl {
             }
             deep = false;
             std::atomic_thread_fence(std::memory_order_acquire);
+            LaneRec lr{};
+            if (lane_tr != nullptr) {
+                lr.seen = now_ns();
+                lane_nph = 0;
+            }
+            if (lane_pf > 0) {   // (the read-ahead stopped: the pools are this request's)
+                std::lock_guard<std::mutex> lk(pool_mu);
+                pf_stop_locked();
+                if (lane_tr != nullptr) lr.pfwait = now_ns() - lr.seen;
+            }
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
             Resp& rp = resps[next % kRing];
             const int T = std::max(1, std::min(kWin, r.T));
@@ -15386,8 +15497,32 @@ struct Model::Impl {
                 }
                 if (!ents.empty()) {
                     const double tc = now_ms();
+                    if (lane_tr != nullptr) {
+                        lr.cpu0 = now_ns();
+                        lr.li = li;
+                        lr.T = T;
+                        lr.nslots = nslots;
+                        lr.nents = (int32_t) ents.size();
+                        for (int q = 0; q < 3; ++q) lr.bytes += (int64_t) (ents.size() * mx_part_bytes(l, q));
+                        const int gn = pf_gn[(size_t) li];
+                        lr.ng = gn;
+                        lr.pfn = pf_sn[(size_t) li];
+                        for (const Ent& en : ents) {
+                            for (int q = 0; q < gn; ++q)
+                                if (pf_gl[(size_t) li][(size_t) q] == en.e) {
+                                    for (int k = 0; k < 4; ++k) lr.hit[k] += q < (1 << k);
+                                    break;
+                                }
+                            for (int q = 0; q < pf_sn[(size_t) li]; ++q) lr.pfhit += pf_set[(size_t) li][(size_t) q] == en.e;
+                        }
+                    }
                     if (store && store->covers(l.il)) cpu_experts_store(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
                     else cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
+                    if (lane_tr != nullptr) {
+                        lr.cpu1 = now_ns();
+                        lr.nph = lane_nph;
+                        for (int q = 0; q < lane_nph; ++q) lr.ph[q] = lane_ph[q];
+                    }
                     lt.c_ms = now_ms() - tc;
                     lt.n_cpu = (int) ents.size();
                     const int D = g.dim;
@@ -15434,6 +15569,16 @@ struct Model::Impl {
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
             *(volatile unsigned*) lane_done = next;
+            if (li >= 0 && li < (int) L.size()) {
+                pf_gn[(size_t) li] = 0;
+                pf_sn[(size_t) li] = 0;
+                if (li + 1 < (int) L.size()) lane_guess(li + 1, r, T);
+            }
+            if (lane_tr != nullptr) {
+                lr.done = now_ns();
+                std::fwrite(&lr, sizeof lr, 1, lane_tr);
+                if ((next & 1023u) == 0) std::fflush(lane_tr);
+            }
             ++next;
             last = std::chrono::steady_clock::now();
         }
