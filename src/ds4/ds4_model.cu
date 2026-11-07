@@ -34,6 +34,7 @@
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
 #include "ds4_pdl.cuh"
+#include <dlfcn.h>
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
 #include "ds4_path_policy.hpp"
@@ -665,6 +666,10 @@ struct Dev {
     };
     std::vector<SegSite> seg;
     unsigned long seg_hits = 0;
+    // DS4_SEG_PROBE: the last probed launches of each (layer, T), and per kernel: launches compared, of them changed
+    std::unordered_map<int, std::vector<std::pair<const void*, uint64_t>>> probe_prev;
+    std::unordered_map<const void*, std::pair<long, long>> probe_tally;
+    long probe_layers = 0, probe_ops = 0, probe_shape = 0;
     // the head group's members (the last layer's group): each its columns (split128 of V) of the head and the norms;
     // logits_part: a member's share of the logits (the lead's: where the others' land before they join its rows)
     x3::Mat head;
@@ -2562,7 +2567,7 @@ struct Model::Impl {
     }();
     const bool seg_log = std::getenv("DS4_SEG_GRAPH_LOG") != nullptr;
     struct SegScope {   // a segment's recording; an early return drops it
-        SegRec r;
+        SegRec& r = seg_tls();
         bool on = false;
         SegScope() = default;
         SegScope(const SegScope&) = delete;
@@ -2571,11 +2576,56 @@ struct Model::Impl {
             if (g_seg == &r) g_seg = nullptr;
         }
     };
+    // DS4_SEG_PROBE=1: a decode layer's launches on its stream hashed and compared with the same layer's (same T) last
+    // time - which kernels' arguments change token to token; a report on CUDA0/1 every 8192 layers (kernel stubs as
+    // offsets in the binary: `nm -C maya-ds4` names them)
+    const bool seg_probe = std::getenv("DS4_SEG_PROBE") != nullptr;
+    struct ProbeScope {
+        Impl* m = nullptr;
+        Dev* d = nullptr;
+        int key = 0;
+        SegProbe p;
+        ProbeScope(Impl* im, Dev& dv, int il, int T, cudaStream_t s, bool on) {
+            if (!on) return;
+            m = im, d = &dv, key = il * 64 + T;
+            p.s = s;
+            g_probe = &p;
+        }
+        ProbeScope(const ProbeScope&) = delete;
+        ProbeScope& operator=(const ProbeScope&) = delete;
+        ~ProbeScope() {
+            if (d == nullptr) return;
+            g_probe = nullptr;
+            auto& prev = d->probe_prev[key];
+            ++d->probe_layers;
+            d->probe_ops += (long) p.ops.size();
+            if (prev.size() == p.ops.size()) {
+                for (size_t i = 0; i < p.ops.size(); ++i) {
+                    auto& t = d->probe_tally[p.ops[i].first];
+                    ++t.first;
+                    t.second += prev[i].first != p.ops[i].first || prev[i].second != p.ops[i].second;
+                }
+            } else if (!prev.empty()) ++d->probe_shape;
+            prev.swap(p.ops);
+            if (d->id <= 1 && (d->probe_layers & 8191) == 0) m->probe_report(*d);
+        }
+    };
+    void probe_report(const Dev& d) {
+        std::fprintf(stderr, "ds4: DS4_SEG_PROBE CUDA%d: %ld layers, %.1f hooked launches a layer, %ld layout changes\n",
+                     d.id, d.probe_layers, (double) d.probe_ops / (double) std::max(1L, d.probe_layers), d.probe_shape);
+        std::vector<std::pair<const void*, std::pair<long, long>>> v(d.probe_tally.begin(), d.probe_tally.end());
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+        for (const auto& [k, t] : v) {
+            Dl_info di{};
+            const uintptr_t off = dladdr(k, &di) && di.dli_fbase ? (uintptr_t) k - (uintptr_t) di.dli_fbase : (uintptr_t) k;
+            std::fprintf(stderr, "ds4: DS4_SEG_PROBE   %#lx  %ld launches, %.1f%% changed\n", (unsigned long) off, t.first,
+                         100.0 * (double) t.second / (double) std::max(1L, t.first));
+        }
+    }
     void seg_begin(SegScope& sc, cudaStream_t s, bool want) {
         sc.on = want;
         if (!want) return;
-        sc.r = SegRec();
-        sc.r.s = s;
+        sc.r.reset(s);
         g_seg = &sc.r;
     }
     void seg_report(const Dev& d) {
@@ -2612,7 +2662,7 @@ struct Model::Impl {
         cudaGraphExec_t ex = nullptr;
         if (!site.off && site.g.size() < (size_t) kSegVariants &&
             cudaStreamBeginCapture(r.s, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
-            for (auto& f : r.ops) f();
+            r.replay();
             cudaGraph_t gr = nullptr;
             const bool cap = cudaStreamEndCapture(r.s, &gr) == cudaSuccess && gr != nullptr;
             if (cap && cudaGraphInstantiate(&ex, gr, 0) != cudaSuccess) ex = nullptr;
@@ -2627,7 +2677,7 @@ struct Model::Impl {
                                  d.id, il, id, site.g.size() >= (size_t) kSegVariants ? "limit" : "capture failed",
                                  site.g.size());
             }
-            for (auto& f : r.ops) f();
+            r.replay();
             return true;
         }
         site.g.emplace(r.h, ex);
@@ -21785,6 +21835,7 @@ struct Model::Impl {
         const bool ma =
             multi_attn && wp.nrow > 0 && d.mext != nullptr && ma_plan(wp.rseq, wp.rpos, T, g.win, l.mtp, d.mplan);
         prof_mark(d, 0);
+        ProbeScope probe(this, d, l.il, T, s, seg_probe && wp.nrow == 0 && wp.async && T <= kWin);
         // Engram
         if (l.eg >= 0) {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
