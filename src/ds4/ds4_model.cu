@@ -1532,6 +1532,7 @@ struct Model::Impl {
         int32_t li, T, nslots, nents, nph, ng;
         int32_t hit[4];   // of the entries, how many the previous layer's CPU-lane guesses held in their first 1 2 4 8
         int32_t pfn, pfhit;   // experts read ahead for this layer, and how many of them it computed
+        int32_t pfdone, pftotal;   // read-ahead chunks done / issued when this request came
     };
     FILE* lane_tr = nullptr;
     int lane_nph = 0;
@@ -1555,8 +1556,12 @@ struct Model::Impl {
     std::vector<std::pair<const uint8_t*, uint32_t>> pf_chunks[4];
     std::function<void(int)> pf_fn[4];
     std::atomic<uint64_t> pf_sink{0};
+    std::atomic<int> pf_done{0};
+    int pf_total = 0, pf_last_done = 0, pf_last_total = 0;
     void pf_stop_locked() {
         if (!pf_on) return;
+        pf_last_done = pf_done.load(std::memory_order_acquire);
+        pf_last_total = pf_total;
         pf_abort.store(true, std::memory_order_release);
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
         pf_abort.store(false, std::memory_order_relaxed);
@@ -15314,8 +15319,12 @@ struct Model::Impl {
                 uint64_t s = 0;
                 for (uint32_t o = 0; o < c.second; o += 64) s += *(volatile const uint64_t*) (c.first + o);
                 pf_sink.fetch_add(s, std::memory_order_relaxed);
+                pf_done.fetch_add(1, std::memory_order_release);
             };
         }
+        pf_done.store(0, std::memory_order_relaxed);
+        pf_total = 0;
+        for (int X = 0; X < NH; ++X) pf_total += (int) pf_chunks[X].size();
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start((int) pf_chunks[X].size(), pf_fn[X]);
         pf_on = true;
     }
@@ -15392,8 +15401,13 @@ struct Model::Impl {
             }
             if (lane_pf > 0) {   // (the read-ahead stopped: the pools are this request's)
                 std::lock_guard<std::mutex> lk(pool_mu);
+                pf_last_done = pf_last_total = 0;
                 pf_stop_locked();
-                if (lane_tr != nullptr) lr.pfwait = now_ns() - lr.seen;
+                if (lane_tr != nullptr) {
+                    lr.pfwait = now_ns() - lr.seen;
+                    lr.pfdone = pf_last_done;
+                    lr.pftotal = pf_last_total;
+                }
             }
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
             Resp& rp = resps[next % kRing];
